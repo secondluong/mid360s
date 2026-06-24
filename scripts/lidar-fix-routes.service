@@ -1,0 +1,14 @@
+[Unit]
+Description=MyView L2 route guard (early boot, before Docker)
+After=network-online.target
+Wants=network-online.target
+Before=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/home/longqr/lidar-bridge-ros/.env
+ExecStart=/home/longqr/lidar-bridge-ros/scripts/fix-routes-boot-guard.sh
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

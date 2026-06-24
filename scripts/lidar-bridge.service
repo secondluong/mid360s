@@ -1,0 +1,18 @@
+[Unit]
+Description=MyView Lidar Bridge (order-agnostic boot)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/home/pi/lidar-bridge-ros
+EnvironmentFile=-/home/pi/lidar-bridge-ros/.env
+
+ExecStartPre=/home/pi/lidar-bridge-ros/scripts/fix-routes.sh
+ExecStart=/usr/bin/docker compose up -d --force-recreate
+ExecStop=/usr/bin/docker compose down
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

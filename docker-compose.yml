@@ -1,0 +1,26 @@
+# Pi5 + L2 直连拓扑：使用 host 网络，UDP 不经 Docker NAT。
+# MyView 调度机在另一台机器上，通过 MYVIEW_SERVER_URL 连接。
+
+services:
+  lidar-bridge-ros:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: myview/lidar-bridge-ros:latest
+    container_name: myview-lidar-bridge-ros
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      # Mount latest startup scripts without rebuilding the ROS image.
+      - ./entrypoint.sh:/opt/myview-relay/entrypoint.sh:ro
+      - ./scripts:/opt/myview-relay/scripts:ro
+      - ./relay/relay.py:/opt/myview-relay/relay/relay.py:ro
+    env_file:
+      - .env
+    environment:
+      ROS_DISTRO: noetic
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"

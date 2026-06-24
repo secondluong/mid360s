@@ -1,0 +1,5 @@
+# Python deps for the MyView Lidar ROS relay.
+# rospy / sensor_msgs / nav_msgs come from ros-noetic apt packages.
+
+websocket-client>=1.6,<2.0
+numpy>=1.20,<2.0
