@@ -22,6 +22,8 @@ services:
       # name and silently breaks git-tracked files (entrypoint.sh / relay.py).
       - ./scripts:/opt/myview-relay/scripts:ro
       - ./relay:/opt/myview-relay/relay:ro
+      # Persist offline catch-up ring across restarts (pose + sparse cloud).
+      - ./data/offline-buffer:/var/lib/myview-relay/offline-buffer
     env_file:
       - .env
     environment:

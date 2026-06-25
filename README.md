@@ -22,8 +22,9 @@ MyView 只负责：接收、扇出、浏览器展示
 
 1. **Raspberry Pi OS 64-bit**（Bookworm 或 Ubuntu 22.04/24.04 + Docker）
 2. **eth0 静态 IP `192.168.1.2/24`**（L2 默认认为 PC 在此地址）
-3. **Docker** 原生 Linux（`network_mode: host`）
-4. Pi 与 MyView 调度机在同一局域网，且调度机 **TCP 3000** 对 Pi 可达
+3. **wlan0 静态 IP `192.168.1.61/24`**（连 MyView 调度机；**不要改**，除非明确要求）
+4. **Docker** 原生 Linux（`network_mode: host`）
+5. Pi 与 MyView 调度机在同一局域网，且调度机 **TCP 3000** 对 Pi 可达
 
 ### eth0 静态 IP 示例（dhcpcd）
 
@@ -123,10 +124,10 @@ curl -H "Authorization: Bearer <token>" http://localhost:3000/api/lidar/status
 ## 注意事项
 
 - **不要与宇树官方 PC 软件同时运行**（争抢 UDP 6101/6201）
-- `docker-compose.yml` 使用 **`network_mode: host`**，仅适用于 Pi 原生 Linux Docker
 - 轨迹来自 Point-LIO `/pointlio/odom`，不是 IMU 积分
 - **点云坐标系**：relay 默认转发 Point-LIO 的**世界系已配准点云** `/pointlio/cloud_registered`（`RELAY_CLOUD_TOPIC`），不是雷达原始扫描 `/unilidar/cloud`。原始扫描以雷达为原点、随设备移动始终缩在原点附近，而轨迹是世界系累加坐标——两者坐标系不同会出现"轨迹飞出点云空间"。已配准点云与 odom 同一世界系，因此点云、轨迹、设备对齐、累积能拼成图
 - `docker-compose.yml` 使用 **`network_mode: host`**，仅适用于 Pi 原生 Linux Docker
+- **断网缓存续传**（默认开）：断线时 pose 全量落盘，点云按 `1 Hz`、每帧约 `800` 点抽稀写入 `./data/offline-buffer` 环形缓冲（默认约 1.5 GiB，写满删最旧）；重连后限速补传。可用 `RELAY_OFFLINE_BUFFER=false` 关闭
 - L2 断线重连后会自动重启 Point-LIO 并重新校准（`watchdog`）
 - 点云默认单帧显示；浏览器内可切换 **3s / 10s / 30s 累积** 提高静止扫描密度
 - `build` 时 `git clone` 报 `server certificate verification failed. CAfile: none`：无法访问 github 或 TLS 被拦截。在 `.env` 里把 `UNILIDAR_SDK2_REPO`/`POINT_LIO_REPO` 换成可达镜像（推荐），或可信网络下临时 `GIT_SSL_NO_VERIFY=1`，再重新 build（见 `.env.example`）

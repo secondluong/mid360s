@@ -57,6 +57,7 @@ from std_msgs.msg import Bool as BoolMsg
 import websocket  # websocket-client
 
 import encoder
+from offline_buffer import OfflineRingBuffer
 
 
 # ── Config (env-driven so docker-compose owns it) ─────────────────────
@@ -68,6 +69,13 @@ def env(name: str, default: Optional[str] = None) -> str:
             raise RuntimeError(f"missing required env var {name}")
         return default
     return v
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
 
 # Manager URL: ws://host:port  (the relay appends the /ws/lidar query string).
 SERVER_URL    = env("MYVIEW_SERVER_URL", "ws://host.docker.internal:3000").rstrip("/")
@@ -96,6 +104,17 @@ ODOM_GAP_RESET_S = float(env("RELAY_ODOM_GAP_RESET_S", "3.0"))
 # IMU must look stationary before we publish initialized poses.
 IMU_GYRO_MAX_STD = float(env("RELAY_IMU_GYRO_MAX_STD", "0.08"))
 IMU_STABLE_SAMPLES = int(env("RELAY_IMU_STABLE_SAMPLES", "40"))
+
+# Offline ring buffer: pose full + cloud @ 1 Hz / ~800 pts, 1.5 GiB ring.
+OFFLINE_BUFFER_ENABLE = env_bool("RELAY_OFFLINE_BUFFER", True)
+OFFLINE_BUFFER_DIR = env(
+    "RELAY_OFFLINE_BUFFER_DIR",
+    "/var/lib/myview-relay/offline-buffer",
+)
+OFFLINE_BUFFER_MAX_BYTES = int(env("RELAY_OFFLINE_BUFFER_MAX_BYTES", str(1536 * 1024 * 1024)))
+OFFLINE_CLOUD_HZ = float(env("RELAY_OFFLINE_CLOUD_HZ", "1.0"))
+OFFLINE_CLOUD_MAX_POINTS = int(env("RELAY_OFFLINE_CLOUD_MAX_POINTS", "800"))
+OFFLINE_CATCHUP_BYTES_PER_SEC = int(env("RELAY_OFFLINE_CATCHUP_BYTES_PER_SEC", str(2 * 1024 * 1024)))
 
 FIX_ROUTES_SCRIPT = env("FIX_ROUTES_SCRIPT", "/opt/myview-relay/scripts/fix-routes.sh")
 
@@ -190,7 +209,7 @@ class PoseGate:
 # drain it from a single sender thread that owns the socket.
 
 class Sender:
-    def __init__(self):
+    def __init__(self, offline: Optional[OfflineRingBuffer] = None):
         self._q: "queue.Queue[tuple]" = queue.Queue(maxsize=MAX_QUEUED_FRAMES * 4)
         self._stop = threading.Event()
         self._ws_lock = threading.Lock()
@@ -199,11 +218,20 @@ class Sender:
         self._dropped = 0
         self._sent_cloud = 0
         self._sent_text = 0
+        self._buffered = 0
+        self._catchup_sent = 0
         self._last_cloud_at = 0.0
         self._last_pose_at = 0.0
         self._last_log_at = 0.0
         self._last_log_dropped = 0
+        self._offline = offline
+        self._catchup_tokens = float(OFFLINE_CATCHUP_BYTES_PER_SEC)
+        self._catchup_last_t = time.time()
         self.thread = threading.Thread(target=self._run, name="relay-sender", daemon=True)
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
 
     def start(self):
         self.thread.start()
@@ -222,9 +250,18 @@ class Sender:
             self._q.put_nowait(("__stop__", None))
         except queue.Full:
             pass
+        if self._offline is not None:
+            try:
+                self._offline.close()
+            except Exception:
+                pass
 
     def post_binary(self, payload: bytes, kind: str = "cloud"):
-        """Enqueue a binary frame. `kind` is just a tag for the drop log."""
+        """Enqueue a binary frame, or sparse-buffer it while offline."""
+        if not self._connected and self._offline is not None:
+            if self._offline.append_cloud(payload):
+                self._buffered += 1
+            return True
         try:
             self._q.put_nowait(("bin", payload))
             return True
@@ -235,10 +272,21 @@ class Sender:
                 self._q.put_nowait(("bin", payload))
                 return True
             except queue.Full:
+                # Live queue full while (re)connected — keep a sparse copy.
+                if self._offline is not None and self._offline.append_cloud(payload):
+                    self._buffered += 1
+                    return True
                 self._dropped += 1
                 return False
 
     def post_text(self, payload: str):
+        is_pose = '"type":"pose"' in payload
+        # Offline: keep every pose; drop imu/status (high rate / low value).
+        if not self._connected and self._offline is not None:
+            if is_pose:
+                self._offline.append_pose_text(payload)
+                self._buffered += 1
+            return True
         try:
             self._q.put_nowait(("txt", payload))
             return True
@@ -249,6 +297,10 @@ class Sender:
                 self._q.put(("txt", payload), timeout=0.05)
                 return True
             except queue.Full:
+                if is_pose and self._offline is not None:
+                    self._offline.append_pose_text(payload)
+                    self._buffered += 1
+                    return True
                 self._dropped += 1
                 return False
 
@@ -260,6 +312,19 @@ class Sender:
             self._q.get_nowait()
         except queue.Empty:
             pass
+
+    def _buffer_failed_send(self, kind: str, payload) -> None:
+        if self._offline is None:
+            return
+        try:
+            if kind == "bin":
+                self._offline.force_append("bin", payload)
+                self._buffered += 1
+            elif kind == "txt" and isinstance(payload, str) and '"type":"pose"' in payload:
+                self._offline.force_append("txt", payload)
+                self._buffered += 1
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"[relay] offline buffer write failed: {e}")
 
     # ── private ──
 
@@ -277,7 +342,11 @@ class Sender:
             with self._ws_lock:
                 self._ws = ws
             self._connected = True
-            rospy.loginfo("[relay] connected")
+            pending = self._offline.pending() if self._offline else False
+            rospy.loginfo(
+                "[relay] connected%s",
+                " — will catch up offline buffer" if pending else "",
+            )
             return True
         except Exception as e:
             self._connected = False
@@ -285,7 +354,7 @@ class Sender:
             fix_routes()
             return False
 
-    def _send_one(self, kind: str, payload):
+    def _send_one(self, kind: str, payload) -> bool:
         with self._ws_lock:
             ws = self._ws
         if ws is None:
@@ -310,7 +379,36 @@ class Sender:
                 except Exception: pass
                 self._ws = None
             self._connected = False
+            self._buffer_failed_send(kind, payload)
             return False
+
+    def _refill_catchup_tokens(self) -> None:
+        now = time.time()
+        dt = max(0.0, now - self._catchup_last_t)
+        self._catchup_last_t = now
+        self._catchup_tokens = min(
+            float(OFFLINE_CATCHUP_BYTES_PER_SEC) * 2.0,
+            self._catchup_tokens + dt * float(OFFLINE_CATCHUP_BYTES_PER_SEC),
+        )
+
+    def _try_catchup_one(self) -> bool:
+        """Send one buffered record if tokens allow. True if work was done."""
+        if self._offline is None or not self._offline.pending():
+            return False
+        self._refill_catchup_tokens()
+        if self._catchup_tokens < 256:
+            return False
+        item = self._offline.pop_oldest()
+        if item is None:
+            return False
+        kind, payload = item
+        nbytes = len(payload) if isinstance(payload, (bytes, bytearray)) else len(payload.encode("utf-8"))
+        if not self._send_one(kind, payload):
+            # _send_one already re-buffered on failure when possible.
+            return True
+        self._catchup_tokens -= float(nbytes)
+        self._catchup_sent += 1
+        return True
 
     def _run(self):
         backoff = 0.5
@@ -322,9 +420,15 @@ class Sender:
                     continue
                 backoff = 0.5
 
+            # Prefer draining the offline ring so the gap is filled before
+            # (or interleaved ahead of) fresh live frames.
+            if self._try_catchup_one():
+                self._maybe_log_stats()
+                continue
+
             # Block briefly so we don't spin when idle.
             try:
-                kind, payload = self._q.get(timeout=0.5)
+                kind, payload = self._q.get(timeout=0.05)
             except queue.Empty:
                 self._maybe_log_stats()
                 continue
@@ -332,7 +436,9 @@ class Sender:
             if kind == "__stop__":
                 break
 
-            self._send_one(kind, payload)
+            if not self._send_one(kind, payload):
+                # Will reconnect on next loop; payload already buffered if pose/cloud.
+                pass
             self._maybe_log_stats()
 
         rospy.loginfo("[relay] sender thread exiting")
@@ -346,10 +452,19 @@ class Sender:
         self._last_log_dropped = self._dropped
         cloud_age = now - self._last_cloud_at if self._last_cloud_at else None
         pose_age  = now - self._last_pose_at  if self._last_pose_at  else None
+        offline_bytes = 0
+        offline_pending = False
+        if self._offline is not None:
+            st = self._offline.stats()
+            offline_bytes = st.bytes_on_disk
+            offline_pending = self._offline.pending()
         rospy.loginfo(
             "[relay] stats  sent_cloud=%d sent_text=%d dropped=%d (+%d) "
+            "buffered=%d catchup=%d offline_bytes=%d pending=%s "
             "cloud_age=%s pose_age=%s",
             self._sent_cloud, self._sent_text, self._dropped, new_drops,
+            self._buffered, self._catchup_sent, offline_bytes,
+            "yes" if offline_pending else "no",
             f"{cloud_age:.1f}s" if cloud_age is not None else "—",
             f"{pose_age:.1f}s"  if pose_age  is not None else "—",
         )
@@ -573,8 +688,33 @@ def main():
     rospy.loginfo("  pose settle       = %.1fs", POSE_SETTLE_S)
     rospy.loginfo("  bridge_token      = %s",
                   "<set>" if BRIDGE_TOKEN else "<empty: relying on LAN-trust>")
+    rospy.loginfo(
+        "  offline buffer    = %s",
+        f"on dir={OFFLINE_BUFFER_DIR} max={OFFLINE_BUFFER_MAX_BYTES} "
+        f"cloud={OFFLINE_CLOUD_HZ}Hz/{OFFLINE_CLOUD_MAX_POINTS}pts"
+        if OFFLINE_BUFFER_ENABLE else "off",
+    )
 
-    sender = Sender()
+    offline = None
+    if OFFLINE_BUFFER_ENABLE:
+        try:
+            offline = OfflineRingBuffer(
+                root_dir=OFFLINE_BUFFER_DIR,
+                max_bytes=OFFLINE_BUFFER_MAX_BYTES,
+                cloud_hz=OFFLINE_CLOUD_HZ,
+                cloud_max_points=OFFLINE_CLOUD_MAX_POINTS,
+            )
+            st = offline.stats()
+            rospy.loginfo(
+                "[relay] offline buffer ready  bytes=%d pending=%s",
+                st.bytes_on_disk,
+                "yes" if offline.pending() else "no",
+            )
+        except Exception as e:
+            rospy.logwarn("[relay] offline buffer disabled — init failed: %s", e)
+            offline = None
+
+    sender = Sender(offline=offline)
     sender.start()
 
     relay = Relay(sender)
