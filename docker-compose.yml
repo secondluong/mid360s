@@ -17,10 +17,11 @@ services:
     restart: unless-stopped
     network_mode: host
     volumes:
-      # Mount latest startup scripts without rebuilding the ROS image.
-      - ./entrypoint.sh:/opt/myview-relay/entrypoint.sh:ro
+      # Directory mounts only — never bind-mount a single file path.
+      # If the host file is missing, Docker creates a *directory* with that
+      # name and silently breaks git-tracked files (entrypoint.sh / relay.py).
       - ./scripts:/opt/myview-relay/scripts:ro
-      - ./relay/relay.py:/opt/myview-relay/relay/relay.py:ro
+      - ./relay:/opt/myview-relay/relay:ro
     env_file:
       - .env
     environment:

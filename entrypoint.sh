@@ -23,7 +23,10 @@ require_ip_or_exit
 LIDAR_IP="${LIDAR_IP:-192.168.1.62}"
 PC_IP="${PC_IP:-192.168.1.2}"
 IMU_TOPIC="${RELAY_IMU_TOPIC:-/unilidar/imu}"
-CLOUD_TOPIC="${RELAY_CLOUD_TOPIC:-/unilidar/cloud}"
+# Readiness waits on the raw L2 driver topic. Relay may forward a different
+# topic (e.g. /pointlio/cloud_registered in world frame) via RELAY_CLOUD_TOPIC.
+DRIVER_CLOUD_TOPIC="${DRIVER_CLOUD_TOPIC:-/unilidar/cloud}"
+CLOUD_TOPIC="${DRIVER_CLOUD_TOPIC}"
 ODOM_TOPIC="${RELAY_ODOM_TOPIC:-/pointlio/odom}"
 LAN_IF="${LAN_INTERFACE:-auto}"
 
