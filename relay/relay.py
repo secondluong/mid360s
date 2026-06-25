@@ -380,7 +380,7 @@ class Relay:
         self._prev_pose_pos = None
         self._prev_pose_q   = None
 
-    # — /unilidar/cloud → ULDR binary —
+    # — PointCloud2 → ULDR binary (world-frame registered cloud preferred) —
 
     def on_cloud(self, msg: PointCloud2):
         try:
