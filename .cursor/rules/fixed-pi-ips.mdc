@@ -1,5 +1,5 @@
 ---
-description: Fixed Pi5 LAN IPs ¡ª do not change without explicit user request
+description: Fixed Pi5 LAN IPs — do not change without explicit user request
 alwaysApply: true
 ---
 
@@ -11,8 +11,8 @@ Do **not** change these addresses unless the user explicitly asks:
 |-----------|------|----------|---------------|
 | `eth0` | L2 lidar link | `192.168.1.2/24` | `Wired connection 1` (`never-default`) |
 | `wlan0` | LAN / MyView | `192.168.1.61/24` | `CU_LONGQR_5G` |
-| L2 device | Unitree lidar | `192.168.1.62` (default) | ¡ª |
-| MyView PC | Scheduler | usually `192.168.1.100` (`.env` `MYVIEW_SERVER_URL`) | ¡ª |
+| L2 device | Unitree lidar | `192.168.1.62` (default) | — |
+| MyView PC | Scheduler | usually `192.168.1.100` (`.env` `MYVIEW_SERVER_URL`) | — |
 
 Related env: `PC_IP=192.168.1.2` (means Pi eth0 as seen by L2, not the WiFi IP).
 
