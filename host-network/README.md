@@ -8,7 +8,9 @@ This directory is a **sanitized mirror** of the working setup as of the last exp
 | Interface | IP | NM connection |
 |-----------|----|---------------|
 | `eth0` | `192.168.1.2/24` | `Wired connection 1` (`never-default`, route `192.168.1.62/32`) |
-| `wlan0` | `192.168.1.61/24` | `CU_LONGQR_5G` (gateway `192.168.1.1`) |
+| `wlan0` | `192.168.1.61/24` | `CU_LONGQR_5G` or `mesh61` (equal prio 80; stronger SIGNAL wins in `auto`) |
+
+Switch: `scripts/switch-wifi-env.sh company|mesh|auto|status` — see [`scripts/WIFI_ENV_SWITCH.md`](../scripts/WIFI_ENV_SWITCH.md).
 
 ## Layout
 

@@ -3,6 +3,9 @@ id=CU_LONGQR_5G
 uuid=5e54a552-031c-44ea-9476-88ec0e78c36b
 type=wifi
 interface-name=wlan0
+autoconnect=true
+autoconnect-priority=80
+autoconnect-retries=0
 timestamp=1782447797
 
 [wifi]

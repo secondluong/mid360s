@@ -1,15 +1,26 @@
 # Rollback / install notes for safe WiFi reconnect (host, not Docker).
 
+## Dual environments
+
+See [WIFI_ENV_SWITCH.md](WIFI_ENV_SWITCH.md) for company (`CU_LONGQR_5G`) vs mesh (`mesh61`).
+
+```bash
+./scripts/switch-wifi-env.sh company   # office + internet
+./scripts/switch-wifi-env.sh mesh      # offline mesh LAN
+./scripts/switch-wifi-env.sh auto      # unpin; connect stronger of the two
+./scripts/switch-wifi-env.sh status
+```
+
 ## Install (does NOT restart NetworkManager, does NOT change IPs)
 
 ```bash
 cd /home/longqr/lidar-bridge-ros
-# Copy units (use sudo or docker-root). Paths assume this repo location.
 sudo cp scripts/wifi-power-save-off.service /etc/systemd/system/
 sudo cp scripts/wifi-reconnect-watchdog.service /etc/systemd/system/
 sudo cp scripts/wifi-reconnect-watchdog.timer /etc/systemd/system/
 sudo cp scripts/99-wifi-powersave-off /etc/NetworkManager/dispatcher.d/99-wifi-powersave-off
 sudo chmod 755 /home/longqr/lidar-bridge-ros/scripts/wifi-reconnect-watchdog.sh
+sudo chmod 755 /home/longqr/lidar-bridge-ros/scripts/switch-wifi-env.sh
 sudo chmod 755 /etc/NetworkManager/dispatcher.d/99-wifi-powersave-off
 sudo touch /var/log/wifi-reconnect-watchdog.log
 sudo chmod 644 /var/log/wifi-reconnect-watchdog.log
@@ -29,7 +40,7 @@ sudo rm -f /etc/systemd/system/wifi-reconnect-watchdog.timer
 sudo systemctl daemon-reload
 ```
 
-If WiFi is broken and you need configs: restore from `~/wifi-working-backup/` (contains secrets; not in git).
+If WiFi is broken: restore from `~/wifi-working-backup/` (secrets; not in git).
 
 ## Soft test
 

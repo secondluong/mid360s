@@ -1,19 +1,19 @@
 #!/bin/bash
-# Safe WiFi reconnect watchdog for Pi5.
+# Safe WiFi reconnect watchdog for Pi5 (company + mesh).
 #
 # Does NOT rewrite netplan/NM profiles, change IPs, restart NetworkManager,
-# or toggle nmcli networking. Only re-activates the existing connection.
+# or toggle nmcli networking. Only re-activates existing connections.
 #
-# Fixed (do not change unless user explicitly requests):
-#   wlan0 IP: 192.168.1.61
-#   preferred connection: CU_LONGQR_5G
+# Fixed: wlan0 = 192.168.1.61
+# Profiles: CU_LONGQR_5G (company), mesh61 (mesh)
+# desired=auto -> connect / roam by stronger SIGNAL (with hysteresis)
 
 set -uo pipefail
 
-IFACE="wlan0"
-EXPECT_IP="192.168.1.61"
-# Preferred NM connection; resolve_conn() falls back if renamed.
-CONN_NAME="CU_LONGQR_5G"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=wifi-env-lib.sh
+source "${SCRIPT_DIR}/wifi-env-lib.sh"
+
 STATE_DIR="/run/wifi-reconnect-watchdog"
 STREAK_FILE="${STATE_DIR}/fail_streak"
 COOLDOWN_FILE="${STATE_DIR}/cooldown_until"
@@ -99,77 +99,98 @@ disable_powersave() {
     || true
 }
 
-# Pick an existing WiFi connection: active on IFACE, then preferred names, then any wifi.
-resolve_conn() {
-  local c
-  c=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null \
-    | awk -F: -v d="${IFACE}" '$2 == d { print $1; exit }')
-  if [ -n "${c}" ]; then
-    echo "${c}"
-    return 0
+# Ordered candidates: pinned env, or strongest-first for auto.
+candidate_conns() {
+  local desired best other
+  desired="$(desired_env)"
+  case "${desired}" in
+    company)
+      echo "${CONN_COMPANY}"
+      ;;
+    mesh)
+      echo "${CONN_MESH}"
+      ;;
+    auto)
+      best="$(pick_strongest_conn)"
+      echo "${best}"
+      if [ "${best}" = "${CONN_COMPANY}" ]; then
+        echo "${CONN_MESH}"
+      else
+        echo "${CONN_COMPANY}"
+      fi
+      ;;
+  esac
+}
+
+try_up() {
+  local conn="$1"
+  if ! nmcli -g NAME connection show "${conn}" >/dev/null 2>&1; then
+    log "recover: skip missing profile ${conn}"
+    return 1
   fi
-  for c in "${CONN_NAME}" "CU_LONGQR_5G" "netplan-wlan0-CU_LONGQR_5G"; do
-    if nmcli -g NAME connection show "${c}" >/dev/null 2>&1; then
-      echo "${c}"
-      return 0
-    fi
-  done
-  c=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null \
-    | awk -F: '$2 == "802-11-wireless" || $2 == "wifi" { print $1; exit }')
-  if [ -n "${c}" ]; then
-    echo "${c}"
-    return 0
-  fi
-  return 1
+  log "recover: nmcli connection up ${conn}"
+  nmcli connection up "${conn}" >>"${LOG_FILE}" 2>&1
 }
 
 recover() {
-  local conn
-  conn="$(resolve_conn || true)"
-  if [ -z "${conn}" ]; then
-    log "recover: FAILED (no WiFi connection profile found)"
-    set_cooldown
-    return 1
-  fi
-
-  log "recover: starting (conn=${conn} ip=${EXPECT_IP})"
+  local conn desired
+  desired="$(desired_env)"
+  log "recover: starting desired=${desired} ip=${EXPECT_IP} company_sig=$(ssid_signal "${CONN_COMPANY}") mesh_sig=$(ssid_signal "${CONN_MESH}")"
   disable_powersave
 
-  if command -v nmcli >/dev/null 2>&1; then
-    nmcli connection up "${conn}" >>"${LOG_FILE}" 2>&1 || true
-  fi
-
-  sleep "${POST_UP_WAIT_S}"
-
-  if wifi_healthy; then
-    log "recover: OK after connection up"
-    write_streak 0
-    set_cooldown
-    return 0
-  fi
-
-  log "recover: still unhealthy �� nmcli connection up ${conn} (retry) / device connect ${IFACE}"
-  if command -v nmcli >/dev/null 2>&1; then
-    nmcli connection up "${conn}" >>"${LOG_FILE}" 2>&1 || true
-    sleep 5
-    if ! wifi_healthy; then
-      # Prefer named profile over bare device connect (needs AP path otherwise).
-      nmcli device connect "${IFACE}" >>"${LOG_FILE}" 2>&1 || true
+  local seen="" tried=0
+  while read -r conn; do
+    [ -n "${conn}" ] || continue
+    case " ${seen} " in
+      *" ${conn} "*) continue ;;
+    esac
+    seen="${seen} ${conn}"
+    tried=1
+    if try_up "${conn}"; then
+      sleep "${POST_UP_WAIT_S}"
+      if wifi_healthy; then
+        log "recover: OK via ${conn}"
+        write_streak 0
+        set_cooldown
+        return 0
+      fi
     fi
-  fi
+  done < <(candidate_conns)
 
-  sleep "${POST_UP_WAIT_S}"
-
-  if wifi_healthy; then
-    log "recover: OK after device connect"
-    write_streak 0
+  if [ "${tried}" -eq 0 ]; then
+    log "recover: FAILED (no WiFi connection profile found)"
   else
     log "recover: FAILED (will retry after cooldown; no NM restart)"
   fi
   set_cooldown
 }
 
-# ���� main ����������������������������������������������������������������������������������������������������������������������������������������
+maybe_roam() {
+  local info other other_sig cur cur_sig rest
+  info="$(maybe_roam_to_stronger || true)"
+  [ -n "${info}" ] || return 0
+  other="${info%%|*}"
+  rest="${info#*|}"
+  other_sig="${rest%%|*}"
+  rest="${rest#*|}"
+  cur="${rest%%|*}"
+  cur_sig="${rest##*|}"
+  log "roam: ${cur}(${cur_sig}) -> ${other}(${other_sig}) hysteresis=${SIGNAL_HYSTERESIS}"
+  disable_powersave
+  if try_up "${other}"; then
+    sleep "${POST_UP_WAIT_S}"
+    if wifi_healthy; then
+      log "roam: OK on ${other}"
+      set_cooldown
+    else
+      log "roam: failed, reverting ${cur}"
+      try_up "${cur}" || true
+      set_cooldown
+    fi
+  fi
+}
+
+# ── main ─────────────────────────────────────────────────────────────
 
 if in_cooldown; then
   exit 0
@@ -177,6 +198,8 @@ fi
 
 if wifi_healthy; then
   write_streak 0
+  # While healthy + auto: optionally move to clearly stronger AP.
+  maybe_roam
   exit 0
 fi
 
@@ -186,7 +209,7 @@ case "${streak}" in
 esac
 streak=$((streak + 1))
 write_streak "${streak}"
-log "unhealthy streak=${streak}/${FAIL_THRESHOLD} nm=$(nm_state) ip_ok=$(has_expect_ip && echo yes || echo no) assoc=$(associated && echo yes || echo no)"
+log "unhealthy streak=${streak}/${FAIL_THRESHOLD} nm=$(nm_state) desired=$(desired_env) ip_ok=$(has_expect_ip && echo yes || echo no) assoc=$(associated && echo yes || echo no)"
 
 if [ "${streak}" -ge "${FAIL_THRESHOLD}" ]; then
   recover
