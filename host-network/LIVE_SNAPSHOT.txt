@@ -1,0 +1,29 @@
+# Live snapshot 2026-06-26T12:58:27+08:00
+
+## nmcli device
+DEVICE         TYPE      STATE                   CONNECTION   
+wlan0          wifi      connected               CU_LONGQR_5G 
+docker0        bridge    connected (externally)  docker0      
+lo             loopback  connected (externally)  lo           
+p2p-dev-wlan0  wifi-p2p  disconnected            --           
+eth0           ethernet  unavailable             --           
+
+## nmcli connections
+NAME                UUID                                  TYPE      DEVICE   AUTOCONNECT 
+CU_LONGQR_5G        5e54a552-031c-44ea-9476-88ec0e78c36b  wifi      wlan0    yes         
+docker0             036666ce-02bb-4a39-afbb-d31d1f53ced3  bridge    docker0  no          
+lo                  a451e185-f916-4dba-b743-1de2d8cfb39a  loopback  lo       no          
+Wired connection 1  0e40f97e-f582-3f8d-a8c9-6e651a8548fb  ethernet  --       yes         
+
+## addresses
+lo               UNKNOWN        127.0.0.1/8 
+wlan0            UP             192.168.1.61/24 
+docker0          DOWN           172.17.0.1/16 
+
+## default route
+default via 192.168.1.1 dev wlan0 proto static metric 600 
+
+## wifi
+wlan0     IEEE 802.11  ESSID:"CU_LONGQR_5G"  
+          Mode:Managed  Frequency:5.22 GHz  Access Point: 08:75:58:76:56:44   
+          Power Management:off

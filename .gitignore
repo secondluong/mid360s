@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .DS_Store
 data/
+# Never commit live WiFi PSK copies
+host-network/**/*.nmconnection
+!host-network/**/*.nmconnection.example
+!host-network/**/Wired connection 1.nmconnection
