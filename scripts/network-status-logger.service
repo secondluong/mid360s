@@ -1,0 +1,9 @@
+[Unit]
+Description=Log WiFi/eth0 status snapshot (read-only)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/home/longqr/lidar-bridge-ros/scripts/network-status-logger.sh
+Nice=15

@@ -1,5 +1,5 @@
 ---
-description: Fixed Pi5 LAN IPs ‚Äî do not change without explicit user request
+description: Fixed Pi5 LAN IPs °™ do not change without explicit user request
 alwaysApply: true
 ---
 
@@ -7,13 +7,18 @@ alwaysApply: true
 
 Do **not** change these addresses unless the user explicitly asks:
 
-| Interface | Role | Fixed IP |
-|-----------|------|----------|
-| `eth0` | L2 lidar link | `192.168.1.2/24` |
-| `wlan0` | LAN / MyView | `192.168.1.61/24` |
-| L2 device | Unitree lidar | `192.168.1.62` (default) |
-| MyView PC | Scheduler | usually `192.168.1.100` (`.env` `MYVIEW_SERVER_URL`) |
+| Interface | Role | Fixed IP | NM connection |
+|-----------|------|----------|---------------|
+| `eth0` | L2 lidar link | `192.168.1.2/24` | `Wired connection 1` (`never-default`) |
+| `wlan0` | LAN / MyView | `192.168.1.61/24` | `CU_LONGQR_5G` |
+| L2 device | Unitree lidar | `192.168.1.62` (default) | °™ |
+| MyView PC | Scheduler | usually `192.168.1.100` (`.env` `MYVIEW_SERVER_URL`) | °™ |
 
 Related env: `PC_IP=192.168.1.2` (means Pi eth0 as seen by L2, not the WiFi IP).
 
-Do not rewrite host NetworkManager / netplan / dhcpcd for WiFi ‚Äúhardening‚Äù unless the user explicitly requests it and accepts downtime risk.
+Authoritative config: NetworkManager `system-connections` only.
+Keep cloud-init network disabled (`/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg`).
+Do not put static IPs back into `dhcpcd.conf`.
+WiFi watchdog must prefer `CU_LONGQR_5G`, not `netplan-wlan0-*`.
+
+Do not rewrite host NetworkManager / netplan / dhcpcd for WiFi hardening unless the user explicitly requests it and accepts downtime risk.
