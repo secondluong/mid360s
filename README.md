@@ -127,8 +127,9 @@ curl -H "Authorization: Bearer <token>" http://localhost:3000/api/lidar/status
 - 轨迹来自 Point-LIO `/pointlio/odom`，不是 IMU 积分
 - **点云坐标系**：relay 默认转发 Point-LIO 的**世界系已配准点云** `/pointlio/cloud_registered`（`RELAY_CLOUD_TOPIC`），不是雷达原始扫描 `/unilidar/cloud`。原始扫描以雷达为原点、随设备移动始终缩在原点附近，而轨迹是世界系累加坐标——两者坐标系不同会出现"轨迹飞出点云空间"。已配准点云与 odom 同一世界系，因此点云、轨迹、设备对齐、累积能拼成图
 - `docker-compose.yml` 使用 **`network_mode: host`**，仅适用于 Pi 原生 Linux Docker
-- **断网缓存续传**（默认开）：断线时 pose 全量落盘，点云按 `1 Hz`、每帧约 `800` 点抽稀写入 `./data/offline-buffer` 环形缓冲（默认约 1.5 GiB，写满删最旧）；重连后限速补传。可用 `RELAY_OFFLINE_BUFFER=false` 关闭
-- L2 断线重连后会自动重启 Point-LIO 并重新校准（`watchdog`）
+- **断网缓存续传**（默认开）：断线时 pose 全量落盘到 `./data/offline-buffer` 环形缓冲（默认约 1.5 GiB，写满删最旧），重连后限速补传。**点云默认不缓存**（`RELAY_OFFLINE_CLOUD=false`）——断网期间写点云会抢 Point-LIO 的 CPU/IO，让里程计真的开始漂；重连回放又会把旧帧和实时帧交错送到浏览器，看起来就是点云和轨迹错位。地图本身在 Point-LIO 内存里，断网不受影响。设 `RELAY_OFFLINE_CLOUD=true` 恢复旧的 `1 Hz` / `800` 点抽稀缓存。整体关闭用 `RELAY_OFFLINE_BUFFER=false`
+- **地图 session（世界坐标系标识）**：Point-LIO 的世界原点是节点启动时设备所在的位置，所以每次重启（watchdog 重新初始化、或 launch 的 `respawn`）都会把地图**重新定基**。relay 用 `session` 字符串标记当前世界系——携带不同 session 的点云和轨迹属于不同坐标系，**不能画在一起**。原点变化时立即下发 `{"type":"mapSession","session":...,"reason":...}`，每次重连也会重发；`pose` / `status` JSON 同样带 `session` 字段。`reason` 取值：`startup`、`recalibrate`、`pointlio-restart`（odom seq 回退，说明节点重启过）、`odom-gap`（odom 中断超过 `RELAY_ODOM_GAP_RESET_S`，默认 3s）。前端看到 session 变化应清空已累积的点云和轨迹再重画；忽略该字段则维持旧行为
+- L2 断线重连后会自动重启 Point-LIO 并重新校准（`watchdog`），这会触发一次 session 变更
 - 点云默认单帧显示；浏览器内可切换 **3s / 10s / 30s 累积** 提高静止扫描密度
 - `build` 时 `git clone` 报 `server certificate verification failed. CAfile: none`：无法访问 github 或 TLS 被拦截。在 `.env` 里把 `UNILIDAR_SDK2_REPO`/`POINT_LIO_REPO` 换成可达镜像（推荐），或可信网络下临时 `GIT_SSL_NO_VERIFY=1`，再重新 build（见 `.env.example`）
 

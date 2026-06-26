@@ -2,8 +2,15 @@
 #
 # Policy (survey / coarse replay):
 #   * pose JSON  — store every frame while offline
-#   * cloud ULDR — at most CLOUD_HZ, downsampled to CLOUD_MAX_POINTS
+#   * cloud ULDR — only when the caller opts in (see RELAY_OFFLINE_CLOUD);
+#     at most CLOUD_HZ, downsampled to CLOUD_MAX_POINTS
 #   * imu/status — not stored (tiny value, large volume at IMU rates)
+#
+# Metadata is persisted on a timer rather than per record: Point-LIO emits
+# odom at IMU rate, and rewriting meta.json (tmp file + os.replace) on every
+# pose starved the SD card badly enough to slow Point-LIO itself. A stale
+# read cursor after a crash only replays a few already-sent records, which
+# the viewer tolerates far better than the IO stall did.
 #
 # Layout under `root_dir`:
 #   meta.json          write cursor + segment list
@@ -92,6 +99,7 @@ class OfflineRingBuffer:
         segment_bytes: int = 64 * 1024 * 1024,
         cloud_hz: float = 1.0,
         cloud_max_points: int = 800,
+        meta_sync_interval_s: float = 1.0,
     ):
         self.root_dir = root_dir
         # Callers pass production sizes (GiB); floors only guard against zero/negative.
@@ -99,6 +107,8 @@ class OfflineRingBuffer:
         self.segment_bytes = max(32 * 1024, min(int(segment_bytes), self.max_bytes))
         self.cloud_hz = max(0.05, float(cloud_hz))
         self.cloud_max_points = max(50, int(cloud_max_points))
+        self.meta_sync_interval_s = max(0.0, float(meta_sync_interval_s))
+        self._last_meta_save = 0.0
         self._lock = threading.Lock()
         self._stats = BufferStats()
         self._last_cloud_wall = -1e9
@@ -184,6 +194,22 @@ class OfflineRingBuffer:
                     return ("txt", payload.decode("utf-8", errors="replace"))
                 # skip unknown
 
+    def clear(self) -> None:
+        """Drop everything buffered. Used when the world frame is re-based."""
+        with self._lock:
+            self._close_write_locked()
+            self._close_read_locked()
+            for name in list(self._segments):
+                try:
+                    os.remove(self._seg_path(name))
+                except OSError:
+                    pass
+            self._segments = []
+            self._read_offset = 0
+            self._last_cloud_wall = -1e9
+            self._refresh_bytes_locked()
+            self._save_meta_locked()
+
     def close(self) -> None:
         with self._lock:
             self._close_write_locked()
@@ -220,12 +246,35 @@ class OfflineRingBuffer:
             self._segments = alive
             if not self._segments:
                 self._read_offset = 0
+            self._remove_orphan_segments_locked()
             self._refresh_bytes_locked()
             self._save_meta_locked()
         except Exception:
             self._segments = []
             self._next_seq = 1
             self._read_offset = 0
+
+    def _remove_orphan_segments_locked(self) -> None:
+        """Delete seg files meta.json no longer tracks.
+
+        A crash between creating a segment and persisting meta leaves a file
+        nothing will ever read or evict, so it would occupy the SD card until
+        someone noticed by hand.
+        """
+        known = set(self._segments)
+        try:
+            entries = os.listdir(self.root_dir)
+        except OSError:
+            return
+        for entry in entries:
+            if not (entry.startswith("seg_") and entry.endswith(".bin")):
+                continue
+            if entry[len("seg_"):-len(".bin")] in known:
+                continue
+            try:
+                os.remove(os.path.join(self.root_dir, entry))
+            except OSError:
+                pass
 
     def _save_meta_locked(self) -> None:
         meta = {
@@ -237,6 +286,13 @@ class OfflineRingBuffer:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(meta, f)
         os.replace(tmp, self._meta_path())
+        self._last_meta_save = time.time()
+
+    def _maybe_save_meta_locked(self) -> None:
+        """Persist meta at most once per interval (hot append/drain paths)."""
+        if (time.time() - self._last_meta_save) < self.meta_sync_interval_s:
+            return
+        self._save_meta_locked()
 
     def _refresh_bytes_locked(self) -> None:
         total = 0
@@ -301,16 +357,18 @@ class OfflineRingBuffer:
             float(wall_time),
         )
         assert self._write_fh is not None
+        nbytes = len(hdr) + len(payload)
         self._write_fh.write(hdr)
         self._write_fh.write(payload)
         self._write_fh.flush()
-        self._write_seg_size += len(hdr) + len(payload)
+        self._write_seg_size += nbytes
         self._stats.appended += 1
-        self._refresh_bytes_locked()
+        self._stats.bytes_on_disk += nbytes
         self._evict_locked()
-        self._save_meta_locked()
+        self._maybe_save_meta_locked()
 
     def _evict_locked(self) -> None:
+        evicted = False
         while self._stats.bytes_on_disk > self.max_bytes and len(self._segments) > 1:
             oldest = self._segments[0]
             # If reader is on oldest, close it and reset offset.
@@ -329,11 +387,13 @@ class OfflineRingBuffer:
             self._segments.pop(0)
             self._stats.dropped_evicted += 1
             self._stats.bytes_on_disk = max(0, self._stats.bytes_on_disk - size)
+            evicted = True
             if not self._segments:
                 self._read_offset = 0
         # Single huge segment: if still over max and only one left that is
         # also the write target, leave it (cannot shrink mid-write safely).
-        self._refresh_bytes_locked()
+        if evicted:
+            self._save_meta_locked()
 
     def _open_read_locked(self) -> bool:
         if not self._segments:
@@ -417,5 +477,5 @@ class OfflineRingBuffer:
             return self._read_one_locked()
         self._read_offset = self._read_fh.tell()
         self._stats.drained += 1
-        self._save_meta_locked()
+        self._maybe_save_meta_locked()
         return (int(kind), payload)

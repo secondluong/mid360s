@@ -105,8 +105,17 @@ ODOM_GAP_RESET_S = float(env("RELAY_ODOM_GAP_RESET_S", "3.0"))
 IMU_GYRO_MAX_STD = float(env("RELAY_IMU_GYRO_MAX_STD", "0.08"))
 IMU_STABLE_SAMPLES = int(env("RELAY_IMU_STABLE_SAMPLES", "40"))
 
-# Offline ring buffer: pose full + cloud @ 1 Hz / ~800 pts, 1.5 GiB ring.
+# Offline ring buffer: poses only by default, 1.5 GiB ring.
+#
+# Cloud buffering is off because it cost far more than it bought: writing
+# ULDR frames to the SD card while disconnected stole CPU/IO from Point-LIO
+# (degrading the odometry we were trying to preserve), and replaying them on
+# reconnect interleaved stale frames with live ones so the viewer drew two
+# different moments at once. The map itself lives in Point-LIO's memory and
+# survives the outage regardless. Set RELAY_OFFLINE_CLOUD=true to restore the
+# old behaviour.
 OFFLINE_BUFFER_ENABLE = env_bool("RELAY_OFFLINE_BUFFER", True)
+OFFLINE_CLOUD_ENABLE = env_bool("RELAY_OFFLINE_CLOUD", False)
 OFFLINE_BUFFER_DIR = env(
     "RELAY_OFFLINE_BUFFER_DIR",
     "/var/lib/myview-relay/offline-buffer",
@@ -142,6 +151,48 @@ def build_url() -> str:
     return f"{SERVER_URL}/ws/lidar?{qs}"
 
 
+# ── Map session ──────────────────────────────────────────────────────
+#
+# Point-LIO anchors its world frame wherever the device happened to sit
+# when `laserMapping` started, so every restart (entrypoint's watchdog
+# re-init, or the launch file's respawn=true) silently re-bases the map.
+# Anything the viewer already drew is then in a frame that no longer
+# exists, which reads as the cloud and trajectory "drifting" apart.
+#
+# The session string names the current world frame. It changes on every
+# origin reset so the viewer can drop stale geometry instead of overlaying
+# two coordinate systems.
+
+class MapSession:
+    def __init__(self, device_id: str):
+        self._device_id = device_id
+        self._lock = threading.Lock()
+        self._epoch = int(time.time())
+        self._n = 0
+        self._reason = "startup"
+        self._changed_at = time.time()
+        self._id = self._compose()
+
+    def _compose(self) -> str:
+        return f"{self._device_id}-{self._epoch}-{self._n}"
+
+    def current(self) -> str:
+        with self._lock:
+            return self._id
+
+    def snapshot(self) -> tuple:
+        with self._lock:
+            return self._id, self._reason, self._changed_at
+
+    def bump(self, reason: str) -> tuple:
+        with self._lock:
+            self._n += 1
+            self._reason = reason
+            self._changed_at = time.time()
+            self._id = self._compose()
+            return self._id, self._reason, self._changed_at
+
+
 # ── Pose readiness gate ──────────────────────────────────────────────
 #
 # Point-LIO needs a stationary IMU window at startup. The entrypoint waits
@@ -169,12 +220,14 @@ class PoseGate:
             return False
         return float(np.std(self._gyro_mag)) <= IMU_GYRO_MAX_STD
 
-    def on_odom(self) -> bool:
-        """Record odom; return True when gate just became ready."""
+    def on_odom(self) -> tuple:
+        """Record odom; return (just_became_ready, odom_gap_seen)."""
         now = time.time()
+        gap = False
         with self._lock:
             if self._last_odom_at is not None and (now - self._last_odom_at) > ODOM_GAP_RESET_S:
                 self._reset_locked()
+                gap = True
             self._last_odom_at = now
             if self._first_odom_at is None:
                 self._first_odom_at = now
@@ -184,8 +237,8 @@ class PoseGate:
                 and self._imu_stable_locked()
             ):
                 self._ready = True
-                return True
-            return False
+                return True, gap
+            return False, gap
 
     def recalibrate(self):
         with self._lock:
@@ -225,6 +278,8 @@ class Sender:
         self._last_log_at = 0.0
         self._last_log_dropped = 0
         self._offline = offline
+        self._announce_text: Optional[str] = None
+        self._announce_pending = False
         self._catchup_tokens = float(OFFLINE_CATCHUP_BYTES_PER_SEC)
         self._catchup_last_t = time.time()
         self.thread = threading.Thread(target=self._run, name="relay-sender", daemon=True)
@@ -256,11 +311,16 @@ class Sender:
             except Exception:
                 pass
 
+    def _cloud_buffering(self) -> bool:
+        return OFFLINE_CLOUD_ENABLE and self._offline is not None
+
     def post_binary(self, payload: bytes, kind: str = "cloud"):
-        """Enqueue a binary frame, or sparse-buffer it while offline."""
-        if not self._connected and self._offline is not None:
-            if self._offline.append_cloud(payload):
+        """Enqueue a binary frame. Dropped while offline unless buffering clouds."""
+        if not self._connected:
+            if self._cloud_buffering() and self._offline.append_cloud(payload):
                 self._buffered += 1
+            else:
+                self._dropped += 1
             return True
         try:
             self._q.put_nowait(("bin", payload))
@@ -273,7 +333,7 @@ class Sender:
                 return True
             except queue.Full:
                 # Live queue full while (re)connected — keep a sparse copy.
-                if self._offline is not None and self._offline.append_cloud(payload):
+                if self._cloud_buffering() and self._offline.append_cloud(payload):
                     self._buffered += 1
                     return True
                 self._dropped += 1
@@ -313,11 +373,37 @@ class Sender:
         except queue.Empty:
             pass
 
+    def reset_session(self, session_id: str, reason: str, changed_at: float) -> None:
+        """Re-base the world frame: drop stale-frame data, announce the new one."""
+        drained = 0
+        while True:
+            try:
+                self._q.get_nowait()
+                drained += 1
+            except queue.Empty:
+                break
+        if self._offline is not None:
+            try:
+                self._offline.clear()
+            except Exception as e:
+                rospy.logwarn(f"[relay] offline buffer clear failed: {e}")
+        self._announce_text = encoder.encode_map_session(
+            session=session_id, reason=reason, timestamp=changed_at,
+        )
+        self._announce_pending = True
+        rospy.loginfo(
+            "[relay] map session -> %s (%s); dropped %d queued frames",
+            session_id, reason, drained,
+        )
+
     def _buffer_failed_send(self, kind: str, payload) -> None:
         if self._offline is None:
             return
         try:
             if kind == "bin":
+                if not self._cloud_buffering():
+                    self._dropped += 1
+                    return
                 self._offline.force_append("bin", payload)
                 self._buffered += 1
             elif kind == "txt" and isinstance(payload, str) and '"type":"pose"' in payload:
@@ -342,6 +428,8 @@ class Sender:
             with self._ws_lock:
                 self._ws = ws
             self._connected = True
+            # A fresh consumer has no idea which world frame we are in.
+            self._announce_pending = self._announce_text is not None
             pending = self._offline.pending() if self._offline else False
             rospy.loginfo(
                 "[relay] connected%s",
@@ -420,6 +508,14 @@ class Sender:
                     continue
                 backoff = 0.5
 
+            # The session marker must land before any geometry, otherwise
+            # the viewer attributes new-frame data to the old map.
+            if self._announce_pending and self._announce_text is not None:
+                if self._send_one("txt", self._announce_text):
+                    self._announce_pending = False
+                else:
+                    continue
+
             # Prefer draining the offline ring so the gap is filled before
             # (or interleaved ahead of) fresh live frames.
             if self._try_catchup_one():
@@ -473,9 +569,11 @@ class Sender:
 # ── ROS callbacks ────────────────────────────────────────────────────
 
 class Relay:
-    def __init__(self, sender: Sender):
+    def __init__(self, sender: Sender, session: MapSession):
         self.sender = sender
+        self.session = session
         self._pose_gate = PoseGate()
+        self._last_odom_seq: Optional[int] = None
         # Internal counters / cache for protocol fields that have no ROS
         # equivalent.
         self._cloud_frame_id = 0
@@ -487,13 +585,19 @@ class Relay:
         self._last_ring_num  = 1
         self._last_point_count = 0
 
+    def _rebase_session(self, reason: str):
+        session_id, reason, changed_at = self.session.bump(reason)
+        self._prev_pose_pos = None
+        self._prev_pose_q   = None
+        self.sender.reset_session(session_id, reason, changed_at)
+
     def on_recalibrate(self, msg: BoolMsg):
         if not msg.data:
             return
         rospy.loginfo("[relay] recalibrate — pose gate reset")
         self._pose_gate.recalibrate()
-        self._prev_pose_pos = None
-        self._prev_pose_q   = None
+        self._last_odom_seq = None
+        self._rebase_session("recalibrate")
 
     # — PointCloud2 → ULDR binary (world-frame registered cloud preferred) —
 
@@ -590,7 +694,25 @@ class Relay:
 
     def on_odom(self, msg: Odometry):
         try:
-            just_ready = self._pose_gate.on_odom()
+            # A respawned laserMapping restarts its sequence counter, which
+            # is the only in-band hint that the world origin just moved.
+            seq = int(msg.header.seq)
+            if self._last_odom_seq is not None and seq < self._last_odom_seq:
+                rospy.logwarn(
+                    "[relay] odom seq went backwards (%d -> %d) — Point-LIO restarted",
+                    self._last_odom_seq, seq,
+                )
+                self._pose_gate.recalibrate()
+                self._rebase_session("pointlio-restart")
+            self._last_odom_seq = seq
+
+            just_ready, gap = self._pose_gate.on_odom()
+            if gap:
+                rospy.logwarn(
+                    "[relay] odom gap > %.1fs — treating as new world frame",
+                    ODOM_GAP_RESET_S,
+                )
+                self._rebase_session("odom-gap")
             if just_ready:
                 self._prev_pose_pos = None
                 self._prev_pose_q   = None
@@ -633,6 +755,7 @@ class Relay:
                 translation_delta=dt,
                 rotation_delta_rad=dr,
                 initialized=True,
+                session=self.session.current(),
             )
         except Exception as e:
             rospy.logwarn_throttle(5.0, f"[relay] pose encode failed: {e}")
@@ -669,6 +792,7 @@ class StatusHeartbeat:
                     time_delay_seconds=0.0,
                     last_frame_id=self.relay._cloud_frame_id,
                     last_point_count=self.relay._last_point_count,
+                    session=self.relay.session.current(),
                 )
                 self.sender.post_text(txt)
             except Exception as e:
@@ -691,9 +815,15 @@ def main():
     rospy.loginfo(
         "  offline buffer    = %s",
         f"on dir={OFFLINE_BUFFER_DIR} max={OFFLINE_BUFFER_MAX_BYTES} "
-        f"cloud={OFFLINE_CLOUD_HZ}Hz/{OFFLINE_CLOUD_MAX_POINTS}pts"
+        + (
+            f"cloud={OFFLINE_CLOUD_HZ}Hz/{OFFLINE_CLOUD_MAX_POINTS}pts"
+            if OFFLINE_CLOUD_ENABLE else "pose-only (cloud dropped while offline)"
+        )
         if OFFLINE_BUFFER_ENABLE else "off",
     )
+
+    session = MapSession(DEVICE_ID)
+    rospy.loginfo("  map session       = %s", session.current())
 
     offline = None
     if OFFLINE_BUFFER_ENABLE:
@@ -715,9 +845,13 @@ def main():
             offline = None
 
     sender = Sender(offline=offline)
+    relay = Relay(sender, session)
+    # The container restarts Point-LIO alongside the relay, so anything left
+    # on disk belongs to a world frame the viewer can no longer place.
+    # reset_session drops it and arms the announce for the first connect.
+    sid, reason, changed_at = session.snapshot()
+    sender.reset_session(sid, reason, changed_at)
     sender.start()
-
-    relay = Relay(sender)
 
     # Big queues on cloud so a brief WebSocket hiccup doesn't drop
     # frames the moment they arrive at the ROS bus.

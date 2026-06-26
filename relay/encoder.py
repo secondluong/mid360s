@@ -28,13 +28,25 @@
 #   Pose (text JSON):
 #     {"type":"pose","t":<sec>,"frameId":<u32>,
 #      "p":[x,y,z], "q":[qx,qy,qz,qw],
-#      "dt":<m>, "dr":<rad>, "init":<0|1>}
+#      "dt":<m>, "dr":<rad>, "init":<0|1>, "session":<str>}
 #
 #   Status (text JSON, optional):
 #     {"type":"status","sdkVersion":<str>,"firmwareVersion":<str>,
 #      "hardwareVersion":<str>,"dirtyPercentage":<float>,
 #      "timeDelaySeconds":<float>,"lastFrameId":<u32>,
-#      "lastPointCount":<u32>}
+#      "lastPointCount":<u32>,"session":<str>}
+#
+#   Map session (text JSON):
+#     {"type":"mapSession","session":<str>,"reason":<str>,"t":<sec>}
+#
+#     Point-LIO's world origin is wherever the device sat when the node
+#     started, so every restart silently re-bases the map. `session`
+#     names the current world frame: clouds and poses carrying different
+#     session strings live in different coordinate systems and must not
+#     be drawn together. A `mapSession` frame is emitted the moment the
+#     origin moves (and re-announced right after every reconnect); the
+#     viewer should clear accumulated geometry whenever the value
+#     changes. Consumers that ignore the field keep the old behaviour.
 
 import json
 import struct
@@ -153,8 +165,9 @@ def encode_pose(timestamp: float,
                 orientation: Sequence[float],       # [qx, qy, qz, qw]
                 translation_delta: float = 0.0,
                 rotation_delta_rad: float = 0.0,
-                initialized: bool = True) -> str:
-    return json.dumps({
+                initialized: bool = True,
+                session: str = "") -> str:
+    payload = {
         "type": "pose",
         "t": float(timestamp),
         "frameId": int(frame_id) & 0xFFFFFFFF,
@@ -164,6 +177,20 @@ def encode_pose(timestamp: float,
         "dt": float(translation_delta),
         "dr": float(rotation_delta_rad),
         "init": 1 if initialized else 0,
+    }
+    if session:
+        payload["session"] = str(session)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def encode_map_session(session: str,
+                       reason: str = "",
+                       timestamp: float = 0.0) -> str:
+    return json.dumps({
+        "type": "mapSession",
+        "session": str(session),
+        "reason": str(reason),
+        "t": float(timestamp),
     }, separators=(",", ":"))
 
 
@@ -191,8 +218,9 @@ def encode_status(sdk_version: str = "",
                   dirty_percentage: float = 0.0,
                   time_delay_seconds: float = 0.0,
                   last_frame_id: int = 0,
-                  last_point_count: int = 0) -> str:
-    return json.dumps({
+                  last_point_count: int = 0,
+                  session: str = "") -> str:
+    payload = {
         "type": "status",
         "sdkVersion": str(sdk_version),
         "firmwareVersion": str(firmware_version),
@@ -201,4 +229,7 @@ def encode_status(sdk_version: str = "",
         "timeDelaySeconds": float(time_delay_seconds),
         "lastFrameId": int(last_frame_id) & 0xFFFFFFFF,
         "lastPointCount": int(last_point_count) & 0xFFFFFFFF,
-    }, separators=(",", ":"))
+    }
+    if session:
+        payload["session"] = str(session)
+    return json.dumps(payload, separators=(",", ":"))
