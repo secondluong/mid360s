@@ -1,8 +1,9 @@
 # MyView Lidar ROS bridge (Path A).
 #
 # Runs the upstream Unitree ROS1 stack VERBATIM (no algorithm changes)
-# alongside a thin Python relay that forwards /pointlio/odom, /unilidar/cloud
-# and /unilidar/imu to MyView's existing /ws/lidar producer protocol.
+# alongside a thin Python relay that forwards /pointlio/odom,
+# /pointlio/cloud_registered (world-frame cloud) and /unilidar/imu to
+# MyView's existing /ws/lidar producer protocol.
 #
 # Pinning policy:
 #   * Base image:   `ros:noetic-ros-base-focal` (Ubuntu 20.04 + ROS1).
@@ -26,6 +27,14 @@ ARG UNILIDAR_SDK2_REPO=https://github.com/unitreerobotics/unilidar_sdk2.git
 ARG UNILIDAR_SDK2_REF=main
 ARG POINT_LIO_REPO=https://github.com/unitreerobotics/point_lio_unilidar.git
 ARG POINT_LIO_REF=main
+
+# Set GIT_SSL_NO_VERIFY=1 (build arg) to skip TLS verification for the two
+# github clones. Needed when the build network sits behind an intercepting
+# proxy / firewall that re-signs HTTPS (common in some LANs / regions) and
+# git fails with "server certificate verification failed. CAfile: none".
+# Prefer overriding *_REPO with a reachable mirror instead of disabling
+# verification when you can; only flip this on for a trusted network.
+ARG GIT_SSL_NO_VERIFY=0
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ROS_DISTRO=noetic
@@ -71,7 +80,12 @@ RUN pip3 install --no-cache-dir -r /tmp/relay-requirements.txt
 # `unitree_lidar_sdk/lib/${ARCH}/libunilidar_sdk2.a` �?we don't build
 # anything from the SDK, just clone it so the ROS package can link it.
 WORKDIR /opt
-RUN git clone --depth 1 --branch ${UNILIDAR_SDK2_REF} ${UNILIDAR_SDK2_REPO} unilidar_sdk2
+RUN if [ "${GIT_SSL_NO_VERIFY}" = "1" ]; then git config --global http.sslVerify false; fi \
+    && for i in 1 2 3; do \
+         git clone --depth 1 --branch ${UNILIDAR_SDK2_REF} ${UNILIDAR_SDK2_REPO} unilidar_sdk2 && break; \
+         echo "[build] unilidar_sdk2 clone attempt $i failed; retrying…"; sleep 3; \
+       done \
+    && test -d unilidar_sdk2/.git
 
 # ── Set up the catkin workspace ──────────────────────────────────────
 #
@@ -86,7 +100,12 @@ WORKDIR ${CATKIN_WS}/src
 RUN cp -r /opt/unilidar_sdk2/unitree_lidar_ros/src/unitree_lidar_ros ./unitree_lidar_ros
 
 # Clone Unitree's Point-LIO fork.
-RUN git clone --depth 1 --branch ${POINT_LIO_REF} ${POINT_LIO_REPO} point_lio_unilidar
+RUN if [ "${GIT_SSL_NO_VERIFY}" = "1" ]; then git config --global http.sslVerify false; fi \
+    && for i in 1 2 3; do \
+         git clone --depth 1 --branch ${POINT_LIO_REF} ${POINT_LIO_REPO} point_lio_unilidar && break; \
+         echo "[build] point_lio_unilidar clone attempt $i failed; retrying…"; sleep 3; \
+       done \
+    && test -d point_lio_unilidar/.git
 
 # ── Build the workspace with rosdep + catkin ─────────────────────────
 WORKDIR ${CATKIN_WS}

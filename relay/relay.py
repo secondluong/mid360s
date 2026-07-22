@@ -3,9 +3,22 @@
 #
 # Subscribes to the topics published by the upstream Unitree ROS stack:
 #
-#   /unilidar/cloud           sensor_msgs/PointCloud2  (raw L2 scans)
+#   /pointlio/cloud_registered sensor_msgs/PointCloud2 (WORLD-frame scan)
 #   /unilidar/imu             sensor_msgs/Imu          (raw IMU)
 #   /pointlio/odom            nav_msgs/Odometry        (point_lio output)
+#
+# IMPORTANT — cloud coordinate frame:
+#   We forward Point-LIO's *world-frame* registered cloud
+#   (`/pointlio/cloud_registered`, enabled by `scan_publish_en: true`),
+#   NOT the raw `/unilidar/cloud` sensor-frame scan. The raw scan is
+#   expressed relative to the moving sensor, so it always sits at the
+#   origin; the odom trajectory (also world frame) then appears to fly
+#   off into empty space because the two live in different frames. The
+#   registered cloud is already transformed into the same world frame as
+#   /pointlio/odom, so cloud + trajectory + device marker stay aligned
+#   and accumulation builds a coherent map. Override RELAY_CLOUD_TOPIC
+#   only if your Point-LIO fork advertises the registered cloud under a
+#   different name (confirm with `rostopic list | grep cloud_registered`).
 #
 # …and forwards them to the MyView server's `/ws/lidar?role=producer`
 # endpoint using the exact same wire format the embedded C++ bridge uses
@@ -62,7 +75,10 @@ BRIDGE_TOKEN  = env("MYVIEW_BRIDGE_TOKEN", "")
 DEVICE_ID     = env("MYVIEW_DEVICE_ID", "lidar-l2-01")
 
 # Topic names (mirror Unitree's defaults, overridable for less-standard setups).
-CLOUD_TOPIC   = env("RELAY_CLOUD_TOPIC", "/unilidar/cloud")
+# CLOUD_TOPIC defaults to the WORLD-frame registered cloud from Point-LIO so
+# it shares the odom frame (see the frame note in the module docstring). Set
+# RELAY_CLOUD_TOPIC=/unilidar/cloud to fall back to the raw sensor-frame scan.
+CLOUD_TOPIC   = env("RELAY_CLOUD_TOPIC", "/pointlio/cloud_registered")
 IMU_TOPIC     = env("RELAY_IMU_TOPIC",   "/unilidar/imu")
 ODOM_TOPIC    = env("RELAY_ODOM_TOPIC",  "/pointlio/odom")
 
