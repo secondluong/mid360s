@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # MyView Lidar ROS-to-WebSocket relay.
 #
-# Subscribes to the topics published by the upstream Unitree ROS stack:
+# Subscribes to the Livox Mid-360 + Point-LIO topics:
 #
 #   /pointlio/cloud_registered sensor_msgs/PointCloud2 (WORLD-frame scan)
-#   /unilidar/imu             sensor_msgs/Imu          (raw IMU)
-#   /pointlio/odom            nav_msgs/Odometry        (point_lio output)
+#   /livox/imu                 sensor_msgs/Imu          (raw IMU)
+#   /pointlio/odom             nav_msgs/Odometry        (point_lio output)
 #
 # IMPORTANT — cloud coordinate frame:
 #   We forward Point-LIO's *world-frame* registered cloud
 #   (`/pointlio/cloud_registered`, enabled by `scan_publish_en: true`),
-#   NOT the raw `/unilidar/cloud` sensor-frame scan. The raw scan is
+#   NOT the raw `/livox/lidar` sensor-frame scan. The raw scan is
 #   expressed relative to the moving sensor, so it always sits at the
 #   origin; the odom trajectory (also world frame) then appears to fly
 #   off into empty space because the two live in different frames. The
@@ -26,13 +26,13 @@
 # changes — to them this looks like a normal bridge.
 #
 # Why a separate Python process and not a roscpp subscriber linked into
-# the existing C++ bridge: the Unitree stack only ships ROS1 (noetic),
-# which is Ubuntu-20.04-only. Our C++ bridge lives in the main MyView
+# the existing C++ bridge: Livox-SDK2 + Point-LIO still build on ROS1
+# Noetic (Ubuntu 20.04). Our C++ bridge lives in the main MyView
 # repo and builds on whatever WSL2 distro the operator is running. A
 # Python relay inside the same Docker container as roscore is a much
 # smaller surface area than dragging ROS1 into the C++ build.
 #
-# The relay treats the Unitree ROS stack as a black box: when /pointlio/odom
+# The relay treats the Livox ROS stack as a black box: when /pointlio/odom
 # stops flowing it emits "stale" status; when /cloud stops it just
 # stops sending cloud frames (the hub's stale-frame detection takes over
 # on the server side). It never tries to restart roscore — that's the
@@ -80,14 +80,12 @@ def env_bool(name: str, default: bool = False) -> bool:
 # Manager URL: ws://host:port  (the relay appends the /ws/lidar query string).
 SERVER_URL    = env("MYVIEW_SERVER_URL", "ws://host.docker.internal:3000").rstrip("/")
 BRIDGE_TOKEN  = env("MYVIEW_BRIDGE_TOKEN", "")
-DEVICE_ID     = env("MYVIEW_DEVICE_ID", "lidar-l2-01")
+DEVICE_ID     = env("MYVIEW_DEVICE_ID", "lidar-mid360-01")
 
-# Topic names (mirror Unitree's defaults, overridable for less-standard setups).
-# CLOUD_TOPIC defaults to the WORLD-frame registered cloud from Point-LIO so
-# it shares the odom frame (see the frame note in the module docstring). Set
-# RELAY_CLOUD_TOPIC=/unilidar/cloud to fall back to the raw sensor-frame scan.
+# Topic names (overridable). Cloud defaults to Point-LIO world-frame
+# /pointlio/cloud_registered so it shares the odom frame.
 CLOUD_TOPIC   = env("RELAY_CLOUD_TOPIC", "/pointlio/cloud_registered")
-IMU_TOPIC     = env("RELAY_IMU_TOPIC",   "/unilidar/imu")
+IMU_TOPIC     = env("RELAY_IMU_TOPIC",   "/livox/imu")
 ODOM_TOPIC    = env("RELAY_ODOM_TOPIC",  "/pointlio/odom")
 
 # Backpressure: drop cloud frames if the WebSocket can't keep up. Same
@@ -99,7 +97,7 @@ STATUS_INTERVAL_S = float(env("RELAY_STATUS_INTERVAL_S", "2.0"))
 
 # Hold pose init=0 until Point-LIO has settled (seconds after first odom).
 POSE_SETTLE_S = float(env("RELAY_POSE_SETTLE_S", "8.0"))
-# Reset calibration if odom pauses longer than this (L2 disconnect).
+# Reset calibration if odom pauses longer than this (lidar disconnect).
 ODOM_GAP_RESET_S = float(env("RELAY_ODOM_GAP_RESET_S", "3.0"))
 # IMU must look stationary before we publish initialized poses.
 IMU_GYRO_MAX_STD = float(env("RELAY_IMU_GYRO_MAX_STD", "0.08"))
@@ -611,10 +609,9 @@ class Relay:
 
     def _encode_cloud(self, msg: PointCloud2) -> bytes:
         # Determine which optional fields the lidar driver included.
-        # Unitree's `unitree_lidar_ros` always emits (x,y,z,intensity,
-        # ring,time) on /unilidar/cloud, but we tolerate the lidar_type=
-        # OUST64 / Velodyne layout (no `ring`) too — handy for testing
-        # against bag files from other lidars.
+        # livox_ros_driver2 PointCloud2 typically has (x,y,z,intensity)
+        # and may omit ring/time; we also tolerate the OUST64 / Velodyne
+        # layout (no `ring`) for bag-file tests.
         names = {f.name for f in msg.fields}
         has_intensity = "intensity" in names
         has_ring      = "ring"      in names
@@ -668,7 +665,7 @@ class Relay:
             ring=ring,
         )
 
-    # — /unilidar/imu → JSON —
+    # — /livox/imu → JSON —
 
     def on_imu(self, msg: Imu):
         self._pose_gate.on_imu(msg)

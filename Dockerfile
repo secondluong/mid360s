@@ -1,52 +1,26 @@
-# MyView Lidar ROS bridge (Path A).
+# MyView Lidar ROS bridge — NanoPC-T6 + Livox Mid-360.
 #
-# Runs the upstream Unitree ROS1 stack VERBATIM (no algorithm changes)
-# alongside a thin Python relay that forwards /pointlio/odom,
-# /pointlio/cloud_registered (world-frame cloud) and /unilidar/imu to
-# MyView's existing /ws/lidar producer protocol.
+# Livox-SDK2 + livox_ros_driver2 + Point-LIO, plus the existing Python
+# relay to MyView /ws/lidar. Base image stays ROS1 Noetic (Ubuntu 20.04)
+# because that is what both upstream packages still build against.
 #
-# Pinning policy:
-#   * Base image:   `ros:noetic-ros-base-focal` (Ubuntu 20.04 + ROS1).
-#                   ROS1 noetic is the only ROS the upstream Unitree
-#                   nodes ship for, so we're locked to focal.
-#   * SDK / nodes:  cloned at build time from the official Unitree
-#                   github repos. No git refs pinned right now �?both
-#                   are tagged-release-free repos so we track main.
-#                   If you need byte-stable builds, set the *_REF args
-#                   below to specific commits.
-#
-# Build:
+# Build on the T6 (aarch64), not on an x86 PC:
 #   docker compose build
-# Run:
-#   cp .env.example .env  # set MYVIEW_SERVER_URL, MYVIEW_BRIDGE_TOKEN, L2 IPs
-#   docker compose up
+#   docker compose up -d
 
 FROM ros:noetic-ros-base-focal
 
-ARG UNILIDAR_SDK2_REPO=https://github.com/unitreerobotics/unilidar_sdk2.git
-ARG UNILIDAR_SDK2_REF=main
-ARG POINT_LIO_REPO=https://github.com/unitreerobotics/point_lio_unilidar.git
-ARG POINT_LIO_REF=main
-
-# Set GIT_SSL_NO_VERIFY=1 (build arg) to skip TLS verification for the two
-# github clones. Needed when the build network sits behind an intercepting
-# proxy / firewall that re-signs HTTPS (common in some LANs / regions) and
-# git fails with "server certificate verification failed. CAfile: none".
-# Prefer overriding *_REPO with a reachable mirror instead of disabling
-# verification when you can; only flip this on for a trusted network.
+ARG LIVOX_SDK2_REPO=https://github.com/Livox-SDK/Livox-SDK2.git
+ARG LIVOX_SDK2_REF=master
+ARG LIVOX_ROS_DRIVER2_REPO=https://github.com/Livox-SDK/livox_ros_driver2.git
+ARG LIVOX_ROS_DRIVER2_REF=master
+ARG POINT_LIO_REPO=https://github.com/hku-mars/Point-LIO.git
+ARG POINT_LIO_REF=
 ARG GIT_SSL_NO_VERIFY=0
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ROS_DISTRO=noetic
 
-# ── System deps ───────────────────────────────────────────────────────
-#
-# build-essential / cmake �?to build the SDK static lib + the two ROS
-# nodes from source.
-# python3 + websocket-client + numpy �?the Python relay.
-# ros-noetic-* �?ROS1 message types and pcl_conversions used by the
-# upstream nodes. ros-noetic-ros-base only ships the core; we have to
-# add sensor_msgs / nav_msgs / pcl_ros / pcl_conversions explicitly.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
@@ -57,6 +31,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpcl-dev \
         libeigen3-dev \
         libboost-dev \
+        libpython3-dev \
+        libapr1-dev \
+        pkg-config \
+        python3-dev \
+        python3-matplotlib \
         ros-noetic-pcl-ros \
         ros-noetic-pcl-conversions \
         ros-noetic-tf \
@@ -67,53 +46,59 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-rosdep \
         python3-catkin-tools \
     && command -v ip >/dev/null \
-    && ip -Version \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Python relay deps ────────────────────────────────────────────────
 COPY relay/requirements.txt /tmp/relay-requirements.txt
-RUN pip3 install --no-cache-dir -r /tmp/relay-requirements.txt
+COPY local_viewer/requirements.txt /tmp/viewer-requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/relay-requirements.txt \
+    && pip3 install --no-cache-dir -r /tmp/viewer-requirements.txt
 
-# ── Clone Unitree repos ──────────────────────────────────────────────
-#
-# unilidar_sdk2 ships a precompiled static lib at
-# `unitree_lidar_sdk/lib/${ARCH}/libunilidar_sdk2.a` �?we don't build
-# anything from the SDK, just clone it so the ROS package can link it.
-WORKDIR /opt
+# ── Livox-SDK2 (shared lib used by livox_ros_driver2) ────────────────
+WORKDIR /tmp
 RUN if [ "${GIT_SSL_NO_VERIFY}" = "1" ]; then git config --global http.sslVerify false; fi \
     && for i in 1 2 3; do \
-         git clone --depth 1 --branch ${UNILIDAR_SDK2_REF} ${UNILIDAR_SDK2_REPO} unilidar_sdk2 && break; \
-         echo "[build] unilidar_sdk2 clone attempt $i failed; retrying…"; sleep 3; \
+         git clone --depth 1 --branch ${LIVOX_SDK2_REF} ${LIVOX_SDK2_REPO} Livox-SDK2 && break; \
+         echo "[build] Livox-SDK2 clone attempt $i failed; retrying…"; sleep 3; \
        done \
-    && test -d unilidar_sdk2/.git
+    && test -d Livox-SDK2/.git \
+    && cmake -S Livox-SDK2 -B Livox-SDK2/build \
+    && cmake --build Livox-SDK2/build -j"$(nproc)" \
+    && cmake --install Livox-SDK2/build \
+    && ldconfig \
+    && rm -rf Livox-SDK2
 
-# ── Set up the catkin workspace ──────────────────────────────────────
-#
-# unitree_lidar_ros/CMakeLists.txt references ../../../unitree_lidar_sdk.
-# When flattened into ${CATKIN_WS}/src/unitree_lidar_ros/, that resolves
-# to ${CATKIN_WS}/.. (= /opt/). Symlink satisfies the relative path.
+# ── Catkin workspace ─────────────────────────────────────────────────
 ENV CATKIN_WS=/opt/catkin_ws
-RUN mkdir -p ${CATKIN_WS}/src \
-    && ln -sf /opt/unilidar_sdk2/unitree_lidar_sdk /opt/unitree_lidar_sdk
-
+RUN mkdir -p ${CATKIN_WS}/src
 WORKDIR ${CATKIN_WS}/src
-RUN cp -r /opt/unilidar_sdk2/unitree_lidar_ros/src/unitree_lidar_ros ./unitree_lidar_ros
 
-# Clone Unitree's Point-LIO fork.
 RUN if [ "${GIT_SSL_NO_VERIFY}" = "1" ]; then git config --global http.sslVerify false; fi \
     && for i in 1 2 3; do \
-         git clone --depth 1 --branch ${POINT_LIO_REF} ${POINT_LIO_REPO} point_lio_unilidar && break; \
-         echo "[build] point_lio_unilidar clone attempt $i failed; retrying…"; sleep 3; \
+         git clone --depth 1 --branch ${LIVOX_ROS_DRIVER2_REF} ${LIVOX_ROS_DRIVER2_REPO} livox_ros_driver2 && break; \
+         echo "[build] livox_ros_driver2 clone attempt $i failed; retrying…"; sleep 3; \
        done \
-    && test -d point_lio_unilidar/.git
+    && test -d livox_ros_driver2/.git \
+    && cp -f livox_ros_driver2/package_ROS1.xml livox_ros_driver2/package.xml
 
-# ── Build the workspace with rosdep + catkin ─────────────────────────
+# Point-LIO: empty POINT_LIO_REF = repo default branch.
+RUN if [ "${GIT_SSL_NO_VERIFY}" = "1" ]; then git config --global http.sslVerify false; fi \
+    && if [ -n "${POINT_LIO_REF}" ]; then \
+         git clone --depth 1 --branch "${POINT_LIO_REF}" "${POINT_LIO_REPO}" point_lio; \
+       else \
+         git clone --depth 1 "${POINT_LIO_REPO}" point_lio; \
+       fi \
+    && test -d point_lio/.git
+
+# Official Point-LIO still depends on livox_ros_driver (SDK1). Mid-360
+# needs livox_ros_driver2; rewrite package/message names only.
+# Force Release and enable OpenMP on aarch64 (RK3588 4×A76).
+COPY scripts/patch-point-lio.py /tmp/patch-point-lio.py
+RUN python3 /tmp/patch-point-lio.py ${CATKIN_WS}/src/point_lio \
+    && rm -f /tmp/patch-point-lio.py
+
 WORKDIR ${CATKIN_WS}
 SHELL ["/bin/bash", "-c"]
 
-# rosdep install resolves any missing deps the upstream packages
-# haven't bundled (e.g. specific tf flavours). rosdep init was already
-# done by the base image; we just update.
 RUN rosdep update --rosdistro=${ROS_DISTRO} \
     && apt-get update \
     && rosdep install --from-paths src --ignore-src -y --rosdistro=${ROS_DISTRO} \
@@ -121,11 +106,11 @@ RUN rosdep update --rosdistro=${ROS_DISTRO} \
 
 RUN source /opt/ros/${ROS_DISTRO}/setup.bash \
     && catkin config --extend /opt/ros/${ROS_DISTRO} \
-                     --cmake-args -DCMAKE_BUILD_TYPE=Release \
-    && catkin build -j$(nproc) -DCMAKE_BUILD_TYPE=Release
+                     --cmake-args -DCMAKE_BUILD_TYPE=Release -DROS_EDITION=ROS1 \
+    && catkin build -j"$(nproc)"
 
-# ── Install the relay + launch files ─────────────────────────────────
 COPY relay/    /opt/myview-relay/relay/
+COPY local_viewer/ /opt/myview-relay/local_viewer/
 COPY launch/   /opt/myview-relay/launch/
 COPY config/   /opt/myview-relay/config/
 COPY scripts/  /opt/myview-relay/scripts/
@@ -133,39 +118,41 @@ COPY entrypoint.sh /opt/myview-relay/entrypoint.sh
 RUN chmod +x /opt/myview-relay/entrypoint.sh \
     && chmod +x /opt/myview-relay/scripts/fix-routes.sh \
     && chmod +x /opt/myview-relay/scripts/net-common.sh \
+    && chmod +x /opt/myview-relay/scripts/stamp-livox-config.py \
+    && chmod +x /opt/myview-relay/local_viewer/server.py \
     && test -x "$(command -v ip)"
 
-# Make the relay importable as a normal Python script (no setup.py
-# needed; we just append its dir to PYTHONPATH inside the entrypoint).
 ENV RELAY_DIR=/opt/myview-relay/relay
+ENV VIEWER_DIR=/opt/myview-relay/local_viewer
 ENV LAUNCH_DIR=/opt/myview-relay/launch
 ENV CONFIG_DIR=/opt/myview-relay/config
 ENV SCRIPTS_DIR=/opt/myview-relay/scripts
+ENV LIVOX_CONFIG_PATH=/tmp/myview-MID360_config.json
 
-# ── Default env (overridable by docker-compose / `docker run -e`) ────
-ENV MYVIEW_SERVER_URL=ws://host.docker.internal:3000
+ENV MYVIEW_SERVER_URL=wss://host.docker.internal:3000
 ENV MYVIEW_BRIDGE_TOKEN=
-ENV MYVIEW_DEVICE_ID=lidar-l2-ros
-ENV LIDAR_IP=192.168.1.62
-ENV PC_IP=192.168.1.2
-ENV LIDAR_PORT=6101
-ENV PC_PORT=6201
-ENV WORK_MODE=0
-ENV USE_SYSTEM_TIMESTAMP=true
-ENV CLOUD_SCAN_NUM=18
+ENV MYVIEW_DEVICE_ID=lidar-mid360-01
+ENV MYVIEW_VIA=wan
+ENV LIDAR_IP=192.168.1.12
+ENV PC_IP=192.168.1.50
+ENV LIDAR_SUBNET=192.168.1.0/24
 ENV FIX_ROUTES=true
 ENV LIDAR_INTERFACE=eth0
 ENV LAN_INTERFACE=auto
-ENV L2_WAIT_TIMEOUT_S=0
+ENV WAN_INTERFACE=auto
+ENV LIDAR_WAIT_TIMEOUT_S=0
 ENV LAN_WAIT_TIMEOUT_S=30
+ENV WAN_WAIT_TIMEOUT_S=120
 ENV MYVIEW_WAIT_TIMEOUT_S=120
-ENV L2_UDP_WARMUP_S=5
+ENV LIDAR_UDP_WARMUP_S=5
 ENV IMU_SETTLE_S=8
 ENV LIO_RESTART_ON_READY=true
 ENV RELAY_POSE_SETTLE_S=8
-ENV MYVIEW_WAIT=true
+ENV MYVIEW_WAIT=false
+ENV MYVIEW_RELAY=false
+ENV LOCAL_VIEWER=true
+ENV LOCAL_VIEWER_PORT=8080
+ENV RELAY_IMU_TOPIC=/livox/imu
+ENV DRIVER_CLOUD_TOPIC=/livox/lidar
 
-# Healthcheck: relay process must keep stdout heartbeats. Docker just
-# checks that the bash entrypoint is alive; rospy + the relay handle
-# their own internal supervision.
 ENTRYPOINT ["/opt/myview-relay/entrypoint.sh"]

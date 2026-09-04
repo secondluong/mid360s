@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>板载点云 · Mid-360</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">板载点云</div>
+    <div id="conn" class="pill off">未连接</div>
+    <div id="ready" class="pill off">等待里程计</div>
+
+    <div class="dd" id="layerDd">
+      <button type="button" id="layerBtn" class="dd-btn">图层 4</button>
+      <div class="dd-menu" hidden>
+        <label><input type="checkbox" id="lyCloud" checked /> 点云</label>
+        <label><input type="checkbox" id="lyDevice" checked /> 设备</label>
+        <label><input type="checkbox" id="lyTraj" checked /> 轨迹</label>
+        <label><input type="checkbox" id="lyInfo" checked /> 信息</label>
+      </div>
+    </div>
+
+    <div class="seg" id="modeSeg">
+      <button type="button" data-mode="live">实时</button>
+      <button type="button" data-mode="persist" class="on">持久地图</button>
+    </div>
+    <div class="seg" id="winSeg">
+      <button type="button" data-win="0" class="on">单帧</button>
+      <button type="button" data-win="3">3s</button>
+      <button type="button" data-win="10">10s</button>
+      <button type="button" data-win="30">30s</button>
+    </div>
+
+    <label class="chk"><input type="checkbox" id="horiz" /> 仅水平</label>
+    <label class="num">± <input type="number" id="horizBand" value="0.6" min="0.05" max="5" step="0.1" /> m</label>
+
+    <label class="chk"><input type="checkbox" id="section" /> 剖切</label>
+    <div class="dd" id="floorDd">
+      <button type="button" id="floorBtn" class="dd-btn">楼层 全部</button>
+      <div class="dd-menu" hidden id="floorMenu">
+        <button type="button" class="menu-item on" data-floor="-1">全部</button>
+      </div>
+    </div>
+    <label class="num">层高
+      <select id="floorMode">
+        <option value="auto">自动识别</option>
+        <option value="manual">指定</option>
+      </select>
+    </label>
+    <label class="num" id="floorHWrap" hidden> <input type="number" id="floorH" value="3.0" min="1.5" max="8" step="0.1" /> m</label>
+    <button type="button" id="detectFloors">识别楼层</button>
+
+    <label class="chk"><input type="checkbox" id="follow" checked /> 跟随设备</label>
+    <button type="button" id="fit">看全图</button>
+    <button type="button" id="pause">停止</button>
+  </header>
+
+  <div id="info">
+    <span>点 <b id="nMap">0</b></span>
+    <span>显示 <b id="nVis">0</b></span>
+    <span>轨迹 <b id="nTraj">0</b></span>
+    <span id="floorHint">楼层 —</span>
+    <span id="session" class="session">—</span>
+  </div>
+  <div id="hint">局域网只读 · 地图在板子上累积 · 实时/切片只影响本机显示</div>
+  <canvas id="c"></canvas>
+  <script src="/three.min.js"></script>
+  <script src="/viewer.js"></script>
+</body>
+</html>

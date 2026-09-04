@@ -1,153 +1,142 @@
-# MyView Lidar Bridge — ROS (Pi5 + L2 直连)
+# MyView Lidar Bridge — ROS (NanoPC-T6 + Mid-360)
 
-在树莓派 5 上运行宇树官方 ROS 栈（`unitree_lidar_ros` + `point_lio_unilidar`），通过 Python relay 推送到 MyView 调度机的 `/ws/lidar`。
+在 NanoPC-T6（RK3588）上跑 **Livox Mid-360 / Mid-360s** 官方驱动 + Point-LIO。**地图和轨迹留在板子上**，局域网浏览器只打开页面查看。
+
+本仓库只支持 Livox（`livox_ros_driver2`，SDK `lidar_type: 8`）。默认按**单台**雷达配置。
 
 ## 拓扑
 
 ```
-[L2 192.168.1.62] ──网线 UDP──► [Pi5 eth0 = 192.168.1.2]
-                                      │
-                                      │ WebSocket (局域网)
-                                      ▼
-                         [MyView 调度机 LAN_IP:3000]
-                                      │
-                                      ▼
-                              [浏览器 三维建模]
+[Mid-360 192.168.1.1XX] ──网线──► [T6 ETH = 192.168.1.50]     雷达专网，无默认网关
+                                        │
+[笔记本 / 局域网] ──WiFi STA──► [T6] ──4G──► [MyView 云 /ws/lidar]
+                                        │
+                                   本机 SSH / 调试
 ```
 
-Pi5 负责：收 L2 点云/IMU → Point-LIO 算轨迹 → WebSocket 上行  
-MyView 只负责：接收、扇出、浏览器展示
+- **电口**：只连一台 Mid-360
+- **WiFi**：加入现有路由；笔记本打开 `http://<T6的WiFi IP>:8080` 看点云和轨迹
+- **4G / MyView 云**：本版默认关闭（`MYVIEW_RELAY=false`）
 
-## Pi5 前置条件
+## T6 前置条件
 
-1. **Raspberry Pi OS 64-bit**（Bookworm 或 Ubuntu 22.04/24.04 + Docker）
-2. **eth0 静态 IP `192.168.1.2/24`**（L2 默认认为 PC 在此地址）
-3. **wlan0 静态 IP `192.168.1.61/24`**（连 MyView 调度机；**不要改**，除非明确要求）
-4. **Docker** 原生 Linux（`network_mode: host`）
-5. Pi 与 MyView 调度机在同一局域网，且调度机 **TCP 3000** 对 Pi 可达
+1. FriendlyElec **Ubuntu/Debian 64-bit** + Docker（不要用 FriendlyWrt）
+2. 电口静态 IP **`192.168.1.50/24`**，**不要**默认网关
+3. Mid-360 出厂 IP 为 `192.168.1.1XX`（XX = 序列号后两位），与电口同网段
+4. WiFi STA 加入现场路由；4G 由 ModemManager / NetworkManager 拨号，作为默认路由
+5. 在 **T6 本机** `docker compose build`（aarch64），不要在 x86 Windows 上构建
 
-### eth0 静态 IP 示例（dhcpcd）
+T6 两个电口的 `eth0`/`eth1` 可能随重启对调。用 PCI 路径或 MAC 做 udev 固定名，再写进 `.env` 的 `LIDAR_INTERFACE`。
 
-```
-interface eth0
-static ip_address=192.168.1.2/24
-# eth0 不要设 default gateway — 局域网走 WiFi
-```
+若现场 WiFi 也是 `192.168.1.0/24`，和雷达网段冲突。用 Livox Viewer 2 把雷达改到例如 `192.168.10.1xx`，电口改 `192.168.10.50`，并同步改 `.env` 的 `LIDAR_IP` / `PC_IP` / `LIDAR_SUBNET`。
 
-若 Pi 同时用 **eth0 连 L2** 和 **WiFi 连 MyView**（都在 192.168.1.0/24），必须做路由拆分，否则 L2 先上电时访问调度机会走错网卡。容器启动时会自动执行 `scripts/fix-routes.sh`（`FIX_ROUTES=true`），也可在宿主机手动运行。
+## 还要在 T6 上做的（软件已在仓库里）
 
-## 部署步骤
+| 必须现场做 | 一键脚本能否代劳 |
+|------------|------------------|
+| 刷 Ubuntu/Debian 64-bit（不要 FriendlyWrt） | 否，先刷机 |
+| 装 Docker、构建镜像（首次 20–40 分钟，要能访问 github） | **能** |
+| 电口 `192.168.1.50/24`、无默认网关 | **能**（NetworkManager） |
+| 把 `LIDAR_IP` 写成这台雷达的 `192.168.1.1XX` | 脚本参数，你填序列号后两位 |
+| WiFi 加入现场路由 | 可选参数 `--wifi-ssid` / `--wifi-psk` |
+| 开机自启 | **能**（systemd） |
+| T6 双电口对调时钉死网卡名 | 脚本会 ping 雷达认口；不稳再用 udev |
+| 真机校准、浏览器看图 | 否，上电后打开页面 |
 
-### 1. 拷贝目录到 Pi5
+github 被墙时加 `--mirror`，或在 `.env` 里换镜像仓库。
 
-将本仓库的 `lidar-bridge-ros/` 目录复制到 Pi（git clone 或 scp 均可）。
+## 一键安装（在 T6 上）
 
-### 2. 配置 `.env`
+把仓库拷到板子后：
 
 ```bash
 cd lidar-bridge-ros
-cp .env.example .env
-nano .env
+sudo ./scripts/install-t6.sh --lidar-ip 192.168.1.1XX
+# 可选一并配 WiFi：
+# sudo ./scripts/install-t6.sh --lidar-ip 192.168.1.1XX \
+#   --wifi-ssid 现场SSID --wifi-psk '密码'
 ```
 
-必改项：
+脚本会：写 `.env`、装 Docker、配雷达电口、构建并启动容器、打开 systemd。结束后看打印的 `http://<WiFi IP>:8080`。
 
-| 变量 | 说明 |
-|------|------|
-| `MYVIEW_SERVER_URL` | 调度机地址，如 `ws://192.168.1.100:3000` |
-| `PC_IP` | 保持 `192.168.1.2`（Pi eth0） |
-| `LIDAR_IP` | L2 地址，默认 `192.168.1.62` |
-
-可选：`MYVIEW_BRIDGE_TOKEN` 与调度机 `LIDAR_BRIDGE_TOKEN` 一致。
-
-开机顺序相关（已内置，一般不用改）：
-
-| 变量 | 说明 |
-|------|------|
-| `FIX_ROUTES` | 自动拆分 L2 / MyView 路由，默认 `true` |
-| `LAN_INTERFACE` | 连 MyView 的网卡，`auto` 自动检测（默认） |
-| `L2_UDP_WARMUP_S` | L2 ping 通后再等秒数（UDP 稳定），默认 `5` |
-| `IMU_SETTLE_S` | 静止等待秒数，默认 `8`（会执行两次） |
-| `RELAY_POSE_SETTLE_S` | relay 开始推轨迹前的额外等待，默认 `8` |
-
-### 3. 构建并启动
+检查：
 
 ```bash
-docker compose build    # 首次约 15–30 分钟（clone + catkin build）
-docker compose up -d
+./scripts/preflight-t6.sh
 docker compose logs -f
+```
+
+### 手动部署（不用脚本时）
+
+```bash
+cp .env.example .env
+nano .env          # 至少改 LIDAR_IP
+docker compose build
+docker compose up -d
 ```
 
 成功日志示例：
 
 ```
-[entrypoint] wlan0 has IPv4
-[fix-routes] route-get 192.168.1.100 via wlan0
-[entrypoint] L2 reachable
-[entrypoint] MyView TCP reachable
-[entrypoint] post-restart IMU settle (8s)…
-[entrypoint] pipeline ready — starting relay
-[relay] connected
-[relay] pose gate ready — forwarding initialized poses
+[entrypoint] LAN/WiFi ready on wlan0
+[entrypoint] starting on-board viewer http://0.0.0.0:8080/
+[entrypoint] Mid-360 ready
+[entrypoint] pipeline ready — Mid-360 stack calibrated
 ```
 
-**L2 和 Pi 任意顺序上电即可**。Pi 先开时会先等 WiFi → 等 L2 → 等 MyView 可达 → 再启动算法；全程约 30–40 秒，**校准完成后再移动**。
+校准完成前不要移动设备。同一 WiFi 下的电脑浏览器打开：
 
-可选：用 systemd 托管（修改 `scripts/lidar-bridge.service` 里的路径后）：
-
-```bash
-sudo cp scripts/lidar-bridge.service /etc/systemd/system/
-sudo systemctl enable --now lidar-bridge
+```
+http://<T6的WiFi IP>:8080
 ```
 
-### 4. MyView 调度机
+页面只读。断线或刷新会重新拉取板上**当前**地图和轨迹，不会把旧帧和新帧拼在一起。
 
-1. 启动 MyView server（`node index.js` 或 `start.bat`）
-2. 浏览器登录 → **三维建模** → **实时雷达点云**
-3. 等待校准完成（轨迹 `init=1`）后再移动设备
+### 4. 局域网查看
+
+1. 笔记本连同一 WiFi
+2. 浏览器打开 `http://<T6的WiFi IP>:8080`
+3. 等页面显示「里程计就绪」后再移动设备
+
+本机预览（无雷达时）：`cd local_viewer && pip install -r requirements.txt && python server.py --demo`
 
 ### 5. 诊断
 
-Pi 上：
-
 ```bash
-curl http://<调度机IP>:3000/api/lidar/preflight
-# 应返回 hasProducer: true, textCounts.pose 增长
-```
-
-调度机（需登录 session）：
-
-```bash
-curl -H "Authorization: Bearer <token>" http://localhost:3000/api/lidar/status
+ip -br addr
+ip route
+ping -I <LIDAR_INTERFACE> <LIDAR_IP>
+ip route get <LIDAR_IP>          # 必须走电口
+ip route get 8.8.8.8             # 必须走 4G
+curl -I https://<MyView主机>:3000
 ```
 
 ## 注意事项
 
-- **不要与宇树官方 PC 软件同时运行**（争抢 UDP 6101/6201）
 - 轨迹来自 Point-LIO `/pointlio/odom`，不是 IMU 积分
-- **点云坐标系**：relay 默认转发 Point-LIO 的**世界系已配准点云** `/pointlio/cloud_registered`（`RELAY_CLOUD_TOPIC`），不是雷达原始扫描 `/unilidar/cloud`。原始扫描以雷达为原点、随设备移动始终缩在原点附近，而轨迹是世界系累加坐标——两者坐标系不同会出现"轨迹飞出点云空间"。已配准点云与 odom 同一世界系，因此点云、轨迹、设备对齐、累积能拼成图
-- `docker-compose.yml` 使用 **`network_mode: host`**，仅适用于 Pi 原生 Linux Docker
-- **断网缓存续传**（默认开）：断线时 pose 全量落盘到 `./data/offline-buffer` 环形缓冲（默认约 1.5 GiB，写满删最旧），重连后限速补传。**点云默认不缓存**（`RELAY_OFFLINE_CLOUD=false`）——断网期间写点云会抢 Point-LIO 的 CPU/IO，让里程计真的开始漂；重连回放又会把旧帧和实时帧交错送到浏览器，看起来就是点云和轨迹错位。地图本身在 Point-LIO 内存里，断网不受影响。设 `RELAY_OFFLINE_CLOUD=true` 恢复旧的 `1 Hz` / `800` 点抽稀缓存。整体关闭用 `RELAY_OFFLINE_BUFFER=false`
-- **地图 session（世界坐标系标识）**：Point-LIO 的世界原点是节点启动时设备所在的位置，所以每次重启（watchdog 重新初始化、或 launch 的 `respawn`）都会把地图**重新定基**。relay 用 `session` 字符串标记当前世界系——携带不同 session 的点云和轨迹属于不同坐标系，**不能画在一起**。原点变化时立即下发 `{"type":"mapSession","session":...,"reason":...}`，每次重连也会重发；`pose` / `status` JSON 同样带 `session` 字段。`reason` 取值：`startup`、`recalibrate`、`pointlio-restart`（odom seq 回退，说明节点重启过）、`odom-gap`（odom 中断超过 `RELAY_ODOM_GAP_RESET_S`，默认 3s）。前端看到 session 变化应清空已累积的点云和轨迹再重画；忽略该字段则维持旧行为
-- L2 断线重连后会自动重启 Point-LIO 并重新校准（`watchdog`），这会触发一次 session 变更
-- 点云默认单帧显示；浏览器内可切换 **3s / 10s / 30s 累积** 提高静止扫描密度
-- `build` 时 `git clone` 报 `server certificate verification failed. CAfile: none`：无法访问 github 或 TLS 被拦截。在 `.env` 里把 `UNILIDAR_SDK2_REPO`/`POINT_LIO_REPO` 换成可达镜像（推荐），或可信网络下临时 `GIT_SSL_NO_VERIFY=1`，再重新 build（见 `.env.example`）
+- relay 转发世界系 `/pointlio/cloud_registered`，不要改回原始 `/livox/lidar`（坐标系对不上）
+- `network_mode: host` + `NET_ADMIN`，才能改主机路由
+- 断网时 pose 默认落盘续传；点云默认不缓存（`RELAY_OFFLINE_CLOUD=false`）
+- 地图 session：Point-LIO 每次重启会重新定基，前端看到 `mapSession` 应变应清空再画
+- Mid-360 断线重连后 watchdog 会重启驱动和 Point-LIO（会换 session）
+- 构建时 github 克隆失败：在 `.env` 里换镜像仓库，或可信网络下 `GIT_SSL_NO_VERIFY=1`
 
 ## 架构
 
 ```
 ┌──────── docker (host network) ──────────────────┐
 │  roslaunch bringup.launch                         │
-│    unitree_lidar_ros → /unilidar/*              │
-│    point_lio_unilidar → /pointlio/odom          │
-│                       → /pointlio/cloud_registered│
-│  relay.py → MyView WebSocket                      │
+│    livox_ros_driver2 → /livox/lidar /livox/imu    │
+│    point_lio         → /pointlio/odom             │
+│                      → /pointlio/cloud_registered │
+│  local_viewer → http://<WiFi IP>:8080（主显示）     │
+│  relay.py → MyView /ws/lidar（可选，默认关）        │
 └───────────────────────────────────────────────────┘
 ```
 
-上游算法**零修改**；relay 将 ROS topic 转为 MyView ULDR 二进制 + JSON pose/imu/status。
-
 ## 参考
 
-- [unilidar_sdk2](https://github.com/unitreerobotics/unilidar_sdk2)
-- [point_lio_unilidar](https://github.com/unitreerobotics/point_lio_unilidar)
+- [Livox-SDK2](https://github.com/Livox-SDK/Livox-SDK2)
+- [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2)
+- [Point-LIO](https://github.com/hku-mars/Point-LIO)
+- [NanoPC-T6 Wiki](https://wiki.friendlyelec.com/wiki/index.php/NanoPC-T6)

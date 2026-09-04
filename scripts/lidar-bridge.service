@@ -1,15 +1,16 @@
 [Unit]
-Description=MyView Lidar Bridge (order-agnostic boot)
+Description=MyView Lidar Bridge (T6 Mid-360, order-agnostic boot)
 After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/home/pi/lidar-bridge-ros
-EnvironmentFile=-/home/pi/lidar-bridge-ros/.env
+# Change this path to wherever the repo lives on the T6.
+WorkingDirectory=/opt/lidar-bridge-ros
+EnvironmentFile=-/opt/lidar-bridge-ros/.env
 
-ExecStartPre=/home/pi/lidar-bridge-ros/scripts/fix-routes.sh
+ExecStartPre=/opt/lidar-bridge-ros/scripts/fix-routes.sh
 ExecStart=/usr/bin/docker compose up -d --force-recreate
 ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=600

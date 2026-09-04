@@ -1,26 +1,26 @@
 [connection]
-id=mesh61
+id=wifi-sta
+uuid=b2c3d4e5-f607-8910-bcde-f01234567890
 type=wifi
-interface-name=wlan0
 autoconnect=true
 autoconnect-priority=80
 autoconnect-retries=0
 
 [wifi]
 mode=infrastructure
-ssid=mesh61
-powersave=2
+ssid=<SET_WIFI_SSID>
 
 [wifi-security]
+auth-alg=open
 key-mgmt=wpa-psk
 psk=<SET_WIFI_PSK>
 
 [ipv4]
-method=manual
-address1=192.168.1.61/24
+method=auto
 never-default=true
+route-metric=600
 
 [ipv6]
-method=disabled
+method=auto
 
 [proxy]

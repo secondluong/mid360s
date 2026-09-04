@@ -1,0 +1,7 @@
+# Shell/Docker must stay LF so the T6 container can execute them.
+*.sh text eol=lf
+Dockerfile text eol=lf
+entrypoint.sh text eol=lf
+*.service text eol=lf
+*.launch text eol=lf
+*.py text eol=lf

@@ -1,30 +1,37 @@
 <launch>
   <!--
-    Upstream Unitree ROS stack — algorithm nodes unchanged; launch params
-    match point_lio_unilidar/launch/mapping_unilidar_l2.launch verbatim.
+    NanoPC-T6 + single Livox Mid-360 / Mid-360s (SDK lidar_type 8).
 
-    The MyView relay is NOT included here (see entrypoint.sh).
+    livox_ros_driver2  → /livox/lidar  (CustomMsg, xfer_format=1)
+                       → /livox/imu    (Imu)
+    point_lio          → /pointlio/odom
+                       → /pointlio/cloud_registered  (world-frame)
 
-    Pipeline:
-      unitree_lidar_ros            → /unilidar/cloud  (PointCloud2)
-                                    → /unilidar/imu    (Imu)
-      point_lio_unilidar (LIO)     → /pointlio/odom   (nav_msgs/Odometry)
-                                    → /pointlio/path
-                                    → /pointlio/cloud_registered_body
+    Relay is started by entrypoint.sh, not here.
+    LIVOX_CONFIG_PATH must be set to the stamped MID360_config.json.
   -->
 
-  <!-- ── unitree_lidar_ros (driver) ──────────────────────────────── -->
-  <node pkg="unitree_lidar_ros" type="unitree_lidar_ros_node"
-        name="unitree_lidar_ros_node" respawn="true" output="screen">
-    <rosparam command="load" file="$(find unitree_lidar_ros)/config/config.yaml"/>
-  </node>
+  <arg name="livox_config_path" default="$(env LIVOX_CONFIG_PATH)"/>
+  <arg name="pointlio_config" default="$(env CONFIG_DIR)/mid360.yaml"/>
 
-  <!-- ── point_lio_unilidar (LIO) ────────────────────────────────── -->
-  <!-- Params below mirror mapping_unilidar_l2.launch (required for stable odom). -->
-  <node pkg="point_lio_unilidar" type="pointlio_mapping"
+  <!-- Official driver launch uses global params (not namespaced). -->
+  <param name="xfer_format" value="1"/>
+  <param name="multi_topic" value="0"/>
+  <param name="data_src" value="0"/>
+  <param name="publish_freq" type="double" value="10.0"/>
+  <param name="output_data_type" value="0"/>
+  <param name="user_config_path" type="string" value="$(arg livox_config_path)"/>
+  <param name="frame_id" type="string" value="livox_frame"/>
+  <param name="enable_lidar_bag" type="bool" value="false"/>
+  <param name="enable_imu_bag" type="bool" value="false"/>
+
+  <node pkg="livox_ros_driver2" type="livox_ros_driver2_node"
+        name="livox_lidar_publisher2" respawn="true" output="screen"/>
+
+  <!-- Launch params follow Point-LIO mapping_avia / Mid-360 practice. -->
+  <node pkg="point_lio" type="pointlio_mapping"
         name="laserMapping" output="screen" respawn="true" respawn_delay="2">
-    <rosparam command="load"
-              file="$(find point_lio_unilidar)/config/unilidar_l2.yaml"/>
+    <rosparam command="load" file="$(arg pointlio_config)"/>
 
     <param name="use_imu_as_input" type="bool" value="0"/>
     <param name="prop_at_freq_of_imu" type="bool" value="1"/>
@@ -36,5 +43,9 @@
     <param name="filter_size_map" type="double" value="0.4"/>
     <param name="cube_side_length" type="double" value="1000"/>
     <param name="runtime_pos_log_enable" type="bool" value="0"/>
+
+    <remap from="/aft_mapped_to_init" to="/pointlio/odom"/>
+    <remap from="/Odometry" to="/pointlio/odom"/>
+    <remap from="/cloud_registered" to="/pointlio/cloud_registered"/>
   </node>
 </launch>

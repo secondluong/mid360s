@@ -1,28 +1,31 @@
-# Pi5 + L2 直连拓扑：使用 host 网络，UDP 不经 Docker NAT。
-# MyView 调度机在另一台机器上，通过 MYVIEW_SERVER_URL 连接。
+# NanoPC-T6: Mid-360 on ethernet, MyView cloud via 4G, WiFi STA for LAN.
+# host network so Livox UDP and 4G/WiFi routes are not NATed.
 
 services:
   lidar-bridge-ros:
     build:
       context: .
       dockerfile: Dockerfile
-      # Override repo URLs with a mirror, or set GIT_SSL_NO_VERIFY=1, when the
-      # build host can't verify github's TLS cert (see .env.example / README).
       args:
-        UNILIDAR_SDK2_REPO: ${UNILIDAR_SDK2_REPO:-https://github.com/unitreerobotics/unilidar_sdk2.git}
-        POINT_LIO_REPO: ${POINT_LIO_REPO:-https://github.com/unitreerobotics/point_lio_unilidar.git}
+        LIVOX_SDK2_REPO: ${LIVOX_SDK2_REPO:-https://github.com/Livox-SDK/Livox-SDK2.git}
+        LIVOX_ROS_DRIVER2_REPO: ${LIVOX_ROS_DRIVER2_REPO:-https://github.com/Livox-SDK/livox_ros_driver2.git}
+        POINT_LIO_REPO: ${POINT_LIO_REPO:-https://github.com/hku-mars/Point-LIO.git}
+        POINT_LIO_REF: ${POINT_LIO_REF:-}
         GIT_SSL_NO_VERIFY: ${GIT_SSL_NO_VERIFY:-0}
     image: myview/lidar-bridge-ros:latest
     container_name: myview-lidar-bridge-ros
     restart: unless-stopped
     network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
     volumes:
       # Directory mounts only — never bind-mount a single file path.
-      # If the host file is missing, Docker creates a *directory* with that
-      # name and silently breaks git-tracked files (entrypoint.sh / relay.py).
       - ./scripts:/opt/myview-relay/scripts:ro
       - ./relay:/opt/myview-relay/relay:ro
-      # Persist offline catch-up ring across restarts (pose + sparse cloud).
+      - ./local_viewer:/opt/myview-relay/local_viewer:ro
+      - ./config:/opt/myview-relay/config:ro
+      - ./launch:/opt/myview-relay/launch:ro
       - ./data/offline-buffer:/var/lib/myview-relay/offline-buffer
     env_file:
       - .env

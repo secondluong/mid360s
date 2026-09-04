@@ -2,8 +2,7 @@
 #
 # Mirrors the C++ bridge's frame_codec.{h,cpp} so the JS UI sees byte-
 # identical messages whether the trajectory is computed by our embedded
-# C++ port or by the upstream Unitree ROS stack relayed through this
-# Python bridge.
+# C++ port or by Point-LIO relayed through this Python bridge.
 #
 # Wire format reference (keep in sync with lidar-bridge/src/frame_codec.h):
 #
@@ -22,8 +21,8 @@
 #   IMU (text JSON):
 #     {"type":"imu","stamp":<sec>,"seq":<u32>,
 #      "q":[x,y,z,w], "w":[wx,wy,wz], "a":[ax,ay,az]}
-#     (q is delivered as [x,y,z,w] but in the official ROS pipeline the
-#     unilidar driver always emits identity; LIO doesn't consume it.)
+#     (q is delivered as [x,y,z,w]; livox_ros_driver2 typically emits
+#     identity orientation here — Point-LIO uses gyro/accel, not q.)
 #
 #   Pose (text JSON):
 #     {"type":"pose","t":<sec>,"frameId":<u32>,

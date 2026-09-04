@@ -1,5 +1,5 @@
 #!/bin/bash
-# Host-side: keep fixing routes during Pi early boot (L2 may power on within seconds).
+# Host-side: keep fixing routes during T6 early boot (Mid-360 may come up a few seconds later).
 # Run via systemd before / alongside Docker.
 
 set -euo pipefail
