@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""On-board LAN viewer: accumulate the map here, browsers only look.
+"""On-board LAN viewer: the page keeps the cloud it has already drawn.
 
-WiFi clients open http://<board-wifi-ip>:8080 and receive a snapshot of
-the current voxel map + trajectory, then incremental updates. Reconnect
-always re-downloads current state — no catch-up mix of old and new frames.
+WiFi clients open http://<board-wifi-ip>:8080. Voxels stay in board RAM only
+until a connected page has received them; after that the page owns the copy.
+A reconnect appends whatever arrived while the socket was down. A short
+odometry pause does not wipe the cloud.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import json
 import math
 import os
 import queue
+import struct
 import sys
 import threading
 import time
@@ -23,7 +25,7 @@ from typing import Optional, Set
 import numpy as np
 from aiohttp import WSMsgType, web
 
-from protocol import pack_delta, pack_live, pack_snapshot
+from protocol import KIND_DELTA, KIND_SNAPSHOT, MAGIC, pack_delta, pack_live, pack_snapshot
 from voxel_map import VoxelMap
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -162,8 +164,14 @@ class Hub:
     def pending(self):
         return self._out
 
+    def forget_sent(self, payload: bytes) -> None:
+        pts = float_cloud(payload)
+        if pts is None:
+            return
+        self.map.discard_points(pts)
 
-def attach_ros(hub: Hub, odom_gap_s: float) -> None:
+
+def attach_ros(hub: Hub) -> None:
     import sensor_msgs.point_cloud2 as pc2
     import rospy
     from nav_msgs.msg import Odometry
@@ -216,8 +224,8 @@ def attach_ros(hub: Hub, odom_gap_s: float) -> None:
         if hub._last_odom_seq is not None and seq < hub._last_odom_seq:
             hub.bump_session("pointlio-restart")
         hub._last_odom_seq = seq
-        if hub._last_odom_at is not None and (now - hub._last_odom_at) > odom_gap_s:
-            hub.bump_session("odom-gap")
+        # A pause in odometry is not a new coordinate frame, so it must not
+        # wipe the cloud the page has already drawn.
         hub._last_odom_at = now
 
         if now - last_pose_t[0] < (1.0 / max(POSE_HZ, 1.0)):
@@ -308,7 +316,14 @@ def build_app(hub: Hub) -> web.Application:
         hub.add_client(ws)
         try:
             await ws.send_str(json.dumps(hub.hello(), separators=(",", ":")))
-            await ws.send_bytes(hub.snapshot_bytes())
+            snap = hub.snapshot_bytes()
+            await ws.send_bytes(snap)
+            # Sole page: these voxels are on screen now, so the board can drop
+            # them. Queued deltas stay; the page ignores ones it already has.
+            # With another page still open, keep the remainder until that
+            # page has been sent it too.
+            if hub.client_count() == 1:
+                hub.forget_sent(snap)
             if hub.pose:
                 await ws.send_str(json.dumps(hub.pose, separators=(",", ":")))
             async for msg in ws:
@@ -328,6 +343,7 @@ def build_app(hub: Hub) -> web.Application:
                     await asyncio_sleep()
                     continue
                 dead = []
+                sent = 0
                 with hub._lock:
                     clients = list(hub._clients)
                 for ws in clients:
@@ -339,10 +355,22 @@ def build_app(hub: Hub) -> web.Application:
                             await ws.send_str(payload)
                         else:
                             await ws.send_bytes(payload)
+                        sent += 1
                     except Exception:
                         dead.append(ws)
                 for ws in dead:
                     hub.remove_client(ws)
+                # Forget a cloud frame only after every current page has it.
+                # Live scans (kind 3) are not part of the persistent map.
+                if (
+                    sent
+                    and not dead
+                    and kind == "bin"
+                    and len(payload) > 4
+                    and payload[:4] == MAGIC
+                    and payload[4] in (KIND_SNAPSHOT, KIND_DELTA)
+                ):
+                    hub.forget_sent(payload)
         except asyncio.CancelledError:
             return
 
@@ -367,6 +395,21 @@ async def asyncio_sleep():
     await asyncio.sleep(0.01)
 
 
+def float_cloud(payload: bytes):
+    """XYZ from a float32 snapshot or delta. Quantized frames are left stored."""
+    if len(payload) < 16 or payload[:4] != MAGIC:
+        return None
+    kind = payload[4]
+    flags = payload[5]
+    if kind not in (KIND_SNAPSHOT, KIND_DELTA) or flags & 1:
+        return None
+    npts, _ntraj = struct.unpack_from("<II", payload, 8)
+    nbytes = int(npts) * 12
+    if npts <= 0 or len(payload) < 16 + nbytes:
+        return None
+    return np.frombuffer(payload, dtype=np.float32, count=int(npts) * 3, offset=16).reshape(-1, 3).copy()
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="On-board lidar LAN viewer")
     parser.add_argument("--demo", action="store_true", help="synthetic data, no ROS")
@@ -388,7 +431,7 @@ def main(argv=None) -> int:
             print("[viewer] rospy missing; use --demo to preview the page", file=sys.stderr)
             return 2
         rospy.init_node("local_lidar_viewer", anonymous=False, disable_signals=True)
-        attach_ros(hub, odom_gap_s=float(env("RELAY_ODOM_GAP_RESET_S", "3.0")))
+        attach_ros(hub)
         ros_used = True
 
     app = build_app(hub)

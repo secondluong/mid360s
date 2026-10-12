@@ -14,7 +14,10 @@ source "${SCRIPT_DIR}/net-common.sh"
 require_ip_or_exit
 
 LIDAR_IP="${LIDAR_IP:-192.168.1.12}"
-LIDAR_IF="${LIDAR_INTERFACE:-eth0}"
+LIDAR_IF="$(detect_lidar_interface)"
+# Re-export so the net-common helpers agree with the resolved name.
+LIDAR_INTERFACE="${LIDAR_IF}"
+export LIDAR_INTERFACE
 LAN_IF="${LAN_INTERFACE:-auto}"
 WAN_IF="${WAN_INTERFACE:-auto}"
 LAN_SUBNET="${LAN_SUBNET:-}"
@@ -102,9 +105,28 @@ if iface_exists "${LIDAR_IF}" && iface_has_pc_ip "${LIDAR_IF}"; then
   lidar_route_ok "${LIDAR_IP}" "${LIDAR_IF}" && lidar_route_ready=true
 fi
 
-# WiFi: keep LAN reachability, drop its default so 4G owns the internet.
+# WiFi: keep LAN reachability. Drop its default when 4G is up so WAN owns
+# 0.0.0.0/0. If 4G is down, keep a high-metric WiFi default so IPv4-only
+# clients (蒲公英) can still reach the internet.
 if [ -n "${LAN_IF}" ] && iface_exists "${LAN_IF}"; then
-  _ip route del default dev "${LAN_IF}" 2>/dev/null || true
+  wan_up=false
+  if [ -n "${WAN_IF}" ] && iface_has_ipv4 "${WAN_IF}"; then
+    wan_up=true
+  fi
+  if [ "${wan_up}" = "true" ]; then
+    _ip route del default dev "${LAN_IF}" 2>/dev/null || true
+  else
+    wifi_gw="$(_ip -4 route show default dev "${LAN_IF}" 2>/dev/null | awk '/default/ {print $3; exit}')"
+    if [ -z "${wifi_gw}" ]; then
+      wifi_gw="$(nmcli -g IP4.GATEWAY device show "${LAN_IF}" 2>/dev/null || true)"
+    fi
+    if [ -z "${wifi_gw}" ] || [ "${wifi_gw}" = "--" ]; then
+      wifi_gw="$(nmcli -g IP4.DNS device show "${LAN_IF}" 2>/dev/null | awk 'NR==1{print; exit}')"
+    fi
+    if [ -n "${wifi_gw}" ] && [ "${wifi_gw}" != "--" ]; then
+      _ip route replace default via "${wifi_gw}" dev "${LAN_IF}" metric 700 2>/dev/null || true
+    fi
+  fi
   if [ -n "${LAN_SUBNET}" ]; then
     route_replace "${LAN_SUBNET}" "${LAN_IF}" 100
   fi

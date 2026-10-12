@@ -16,6 +16,11 @@ services:
     container_name: myview-lidar-bridge-ros
     restart: unless-stopped
     network_mode: host
+    # Point-LIO used to grow until the host OOM killer ran. A 4 GB ceiling
+    # kills that process inside the container while SSH on the host still
+    # has memory left. The buffer cap should keep it well under this.
+    mem_limit: 4g
+    memswap_limit: 4g
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -26,7 +31,10 @@ services:
       - ./local_viewer:/opt/myview-relay/local_viewer:ro
       - ./config:/opt/myview-relay/config:ro
       - ./launch:/opt/myview-relay/launch:ro
+      - ./entrypoint.sh:/opt/myview-relay/entrypoint.sh:ro
       - ./data/offline-buffer:/var/lib/myview-relay/offline-buffer
+      - ./data/gift:/opt/myview-relay/data/gift:ro
+      - ./data/fireman:/opt/myview-relay/data/fireman:ro
     env_file:
       - .env
     environment:

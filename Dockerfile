@@ -99,9 +99,29 @@ RUN python3 /tmp/patch-point-lio.py ${CATKIN_WS}/src/point_lio \
 WORKDIR ${CATKIN_WS}
 SHELL ["/bin/bash", "-c"]
 
-RUN rosdep update --rosdistro=${ROS_DISTRO} \
+# rosdep hits raw.githubusercontent.com; retry + CN mirrors when that times out.
+ENV ROSDISTRO_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/rosdistro/index-v4.yaml
+RUN set -e; \
+    if [ -f /etc/ros/rosdep/sources.list.d/20-default.list ]; then \
+      sed -i 's|https://raw.githubusercontent.com|https://ghproxy.net/https://raw.githubusercontent.com|g' \
+        /etc/ros/rosdep/sources.list.d/20-default.list; \
+    fi; \
+    ok=0; \
+    for i in 1 2 3 4 5; do \
+      if rosdep update --rosdistro=${ROS_DISTRO}; then ok=1; break; fi; \
+      echo "[build] rosdep update attempt $i failed; retrying…"; sleep 5; \
+    done; \
+    [ "${ok}" = 1 ] \
     && apt-get update \
     && rosdep install --from-paths src --ignore-src -y --rosdistro=${ROS_DISTRO} \
+    && rm -rf /var/lib/apt/lists/*
+
+# Point-LIO ivox needs glog; rosdep often misses it when mirrors skip a source.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libgoogle-glog-dev \
+        libgflags-dev \
+        libtbb-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN source /opt/ros/${ROS_DISTRO}/setup.bash \
@@ -137,7 +157,7 @@ ENV LIDAR_IP=192.168.1.12
 ENV PC_IP=192.168.1.50
 ENV LIDAR_SUBNET=192.168.1.0/24
 ENV FIX_ROUTES=true
-ENV LIDAR_INTERFACE=eth0
+ENV LIDAR_INTERFACE=auto
 ENV LAN_INTERFACE=auto
 ENV WAN_INTERFACE=auto
 ENV LIDAR_WAIT_TIMEOUT_S=0

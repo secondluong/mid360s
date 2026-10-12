@@ -1,8 +1,8 @@
-"""In-memory voxel map + trajectory for the on-board LAN viewer.
+"""Display voxel map for the on-board viewer.
 
-The browser never accumulates history itself: it asks for a snapshot of
-this store on every (re)connect, so a dropped WiFi session cannot mix
-old and new frames.
+This is the copy sent to the page, not Point-LIO's localization map.
+Voxels leave this store once a connected page has received them. The page
+keeps those points and later reconnects only append the remainder.
 """
 
 from __future__ import annotations
@@ -71,6 +71,28 @@ class VoxelMap:
         if not added:
             return np.zeros((0, 3), dtype=np.float32)
         return np.asarray(added, dtype=np.float32)
+
+    def discard_points(self, xyz: np.ndarray) -> int:
+        """Drop voxel centers that a connected page has already drawn.
+
+        Keys match add_points: a center at (k + 0.5) * voxel.
+        """
+        if xyz is None or len(xyz) == 0:
+            return 0
+        pts = np.asarray(xyz, dtype=np.float32).reshape(-1, 3)
+        if len(pts) == 0:
+            return 0
+        inv = 1.0 / self.voxel
+        ijk = np.floor(pts * inv + 1e-3).astype(np.int32)
+        keys = {tuple(int(v) for v in row) for row in ijk}
+        with self._lock:
+            before = len(self._keys)
+            for key in keys:
+                self._keys.pop(key, None)
+            removed = before - len(self._keys)
+            if removed:
+                self._order = [k for k in self._order if k in self._keys]
+            return removed
 
     def add_pose(self, x: float, y: float, z: float) -> bool:
         p = (float(x), float(y), float(z))

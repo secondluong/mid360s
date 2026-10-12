@@ -16,7 +16,10 @@ fi
 
 LIDAR_IP="${LIDAR_IP:-192.168.1.12}"
 PC_IP="${PC_IP:-192.168.1.50}"
-LIDAR_IF="${LIDAR_INTERFACE:-eth0}"
+LIDAR_IF="$(detect_lidar_interface)"
+# Re-export so the net-common helpers agree with the resolved name.
+LIDAR_INTERFACE="${LIDAR_IF}"
+export LIDAR_INTERFACE
 PORT="${LOCAL_VIEWER_PORT:-8080}"
 ok=0
 warn=0

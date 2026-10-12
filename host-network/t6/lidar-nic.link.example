@@ -1,0 +1,31 @@
+# Pin the Mid-360 ethernet port to a stable name.
+#
+# Install as /etc/systemd/network/10-lidar-nic.link after replacing Path= with
+# this board's value (scripts/install-t6.sh does both automatically):
+#
+#   udevadm info -q property /sys/class/net/eth0 | sed -n 's/^ID_PATH=//p'
+#   → platform-fe190000.pcie-pci-0004:41:00.0
+#
+# Why: the T6 has two r8125 ports on separate PCIe controllers, and the vendor's
+# 50-friendlyelec.link sets no NamePolicy, so both keep the kernel's probe-order
+# names. eth0 and eth1 can therefore swap across reboots, which would hand
+# PC_IP (192.168.1.50) to the LAN-facing port and leave the lidar unreachable.
+#
+# The 10- prefix sorts before 50-friendlyelec.link, so this port's name is
+# decided here; the other port still falls through to the vendor file. Only the
+# first matching .link file is applied, which is why MACAddressPolicy is
+# repeated — dropping it would change this port's MAC.
+#
+# Verify before rebooting:
+#
+#   udevadm test /sys/class/net/eth0 2>&1 | grep "NAME 'lidar0'"
+#
+# ("already up, cannot rename" in that output is expected on a live interface;
+# at boot udev sees the device down and the rename applies.)
+
+[Match]
+Path=platform-REPLACE-ME
+
+[Link]
+Name=lidar0
+MACAddressPolicy=persistent

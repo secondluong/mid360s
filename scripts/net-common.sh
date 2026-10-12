@@ -101,6 +101,45 @@ lidar_route_ok() {
   [ -n "${dev}" ] && [ "${dev}" = "${lidar_if}" ]
 }
 
+detect_lidar_interface() {
+  # The T6's two r8125 ports keep kernel probe-order names, so eth0 and eth1 can
+  # swap across reboots. host-network/t6 pins the lidar port to lidar0 via a
+  # systemd .link file; LIDAR_INTERFACE=auto resolves it without the name being
+  # baked into .env, which also keeps working on a board without that file.
+  local preferred="${LIDAR_INTERFACE:-auto}"
+  local ifname
+
+  if [ "${preferred}" != "auto" ] && [ -n "${preferred}" ]; then
+    echo "${preferred}"
+    return 0
+  fi
+
+  for ifname in $(list_net_interfaces); do
+    case "${ifname}" in
+      lidar*) echo "${ifname}"; return 0 ;;
+    esac
+  done
+
+  # Before the pinned name exists, the port holding PC_IP is the lidar port by
+  # definition — that address is what the Mid-360 streams to.
+  for ifname in $(list_net_interfaces); do
+    is_ignored_iface "${ifname}" && continue
+    if iface_has_pc_ip "${ifname}"; then
+      echo "${ifname}"
+      return 0
+    fi
+  done
+
+  for ifname in eth0 end0 enP4p65s0; do
+    if iface_exists "${ifname}"; then
+      echo "${ifname}"
+      return 0
+    fi
+  done
+
+  echo "eth0"
+}
+
 iface_exists() {
   if ip_available; then
     _ip link show "$1" >/dev/null 2>&1 && return 0

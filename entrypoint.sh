@@ -66,6 +66,11 @@ ROUTE_GUARD_PID=""
 
 refresh_ifaces() {
   local detected=""
+  if [ "${LIDAR_INTERFACE:-auto}" = "auto" ] || [ -z "${LIDAR_IF}" ] || [ "${LIDAR_IF}" = "auto" ]; then
+    if detected="$(detect_lidar_interface)"; then
+      LIDAR_IF="${detected}"
+    fi
+  fi
   if [ "${LAN_INTERFACE:-auto}" = "auto" ] || [ -z "${LAN_IF}" ] || [ "${LAN_IF}" = "auto" ]; then
     if detected="$(detect_lan_interface)"; then
       export_lan_interface "${detected}"
@@ -144,6 +149,7 @@ VIEWER_PID=""
 ROSCORE_PID=""
 LAUNCH_PID=""
 WATCHDOG_PID=""
+MEM_GUARD_PID=""
 _LAST_ROUTE_FIX=0
 CONTAINER_START=$(date +%s)
 CONCURRENT_BOOT=0
@@ -350,6 +356,7 @@ wait_for_lidar() {
   start=$(date +%s)
   attempt=0
   while true; do
+    refresh_ifaces
     apply_routes true
 
     if iface_has_pc_ip "${LIDAR_IF}" "${PC_IP}"; then
@@ -529,6 +536,27 @@ start_local_viewer() {
   VIEWER_PID=$!
 }
 
+# Point-LIO is respawned by roslaunch. Kill it before its RSS can fill the
+# board: the host OOM path freezes SSH and the viewer while ping still works.
+pointlio_mem_guard() {
+  local max_mb="${POINTLIO_RSS_MAX_MB:-2560}"
+  local max_kb=$((max_mb * 1024))
+  echo "[entrypoint] pointlio memory guard: restart above ${max_mb} MB"
+  while true; do
+    local pid rss
+    pid="$(pgrep -n -f /pointlio_mapping || true)"
+    if [ -n "${pid}" ] && [ -r "/proc/${pid}/status" ]; then
+      echo 1000 > "/proc/${pid}/oom_score_adj" 2>/dev/null || true
+      rss="$(awk '/^VmRSS:/ {print $2}' "/proc/${pid}/status")"
+      if [ "${rss:-0}" -gt "${max_kb}" ]; then
+        echo "[entrypoint] pointlio rss ${rss} kB > ${max_kb} kB — restarting it so SSH and the viewer stay up"
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
+    fi
+    sleep 5
+  done
+}
+
 signal_recalibrate() {
   if rostopic list >/dev/null 2>&1; then
     rostopic pub -1 /myview_relay/recalibrate std_msgs/Bool "data: true" >/dev/null 2>&1 || true
@@ -579,6 +607,9 @@ cleanup() {
   echo "[entrypoint] shutting down (caught signal)"
   if [ -n "${WATCHDOG_PID}" ] && kill -0 "${WATCHDOG_PID}" 2>/dev/null; then
     kill -TERM "${WATCHDOG_PID}" 2>/dev/null || true
+  fi
+  if [ -n "${MEM_GUARD_PID}" ] && kill -0 "${MEM_GUARD_PID}" 2>/dev/null; then
+    kill -TERM "${MEM_GUARD_PID}" 2>/dev/null || true
   fi
   if [ -n "${LINK_MON_PID}" ] && kill -0 "${LINK_MON_PID}" 2>/dev/null; then
     kill -TERM "${LINK_MON_PID}" 2>/dev/null || true
@@ -669,6 +700,8 @@ echo "[entrypoint] pipeline ready — Mid-360 stack calibrated"
 # ── 8. Network watchdog ─────────────────────────────────────────────
 network_watchdog &
 WATCHDOG_PID=$!
+pointlio_mem_guard &
+MEM_GUARD_PID=$!
 
 # ── 9. Keep the on-board viewer as the main process ─────────────────
 start_local_viewer

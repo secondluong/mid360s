@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>板载点云 · Mid-360</title>
-  <link rel="stylesheet" href="/style.css" />
+  <link rel="stylesheet" href="/style.css?v=8" />
 </head>
 <body>
   <header class="bar">
@@ -20,17 +20,6 @@
         <label><input type="checkbox" id="lyTraj" checked /> 轨迹</label>
         <label><input type="checkbox" id="lyInfo" checked /> 信息</label>
       </div>
-    </div>
-
-    <div class="seg" id="modeSeg">
-      <button type="button" data-mode="live">实时</button>
-      <button type="button" data-mode="persist" class="on">持久地图</button>
-    </div>
-    <div class="seg" id="winSeg">
-      <button type="button" data-win="0" class="on">单帧</button>
-      <button type="button" data-win="3">3s</button>
-      <button type="button" data-win="10">10s</button>
-      <button type="button" data-win="30">30s</button>
     </div>
 
     <label class="chk"><input type="checkbox" id="horiz" /> 仅水平</label>
@@ -54,19 +43,32 @@
 
     <label class="chk"><input type="checkbox" id="follow" checked /> 跟随设备</label>
     <button type="button" id="fit">看全图</button>
-    <button type="button" id="pause">停止</button>
+    <button type="button" id="saveRec" title="把当前点云和轨迹保存到本机">保存</button>
+    <button type="button" id="replayBtn" title="选择已保存的文件进行回放">回放</button>
+    <input type="file" id="replayFile" accept=".bin,application/octet-stream" hidden />
+    <div id="replayBar" hidden>
+      <button type="button" id="replayPlay">播放</button>
+      <input type="range" id="replayScrub" min="0" max="1000" value="0" />
+      <span id="replayClock">0:00 / 0:00</span>
+      <button type="button" id="replaySpeed" title="播放速度">4×</button>
+      <button type="button" id="replayExit">返回实时</button>
+    </div>
   </header>
 
   <div id="info">
     <span>点 <b id="nMap">0</b></span>
     <span>显示 <b id="nVis">0</b></span>
     <span>轨迹 <b id="nTraj">0</b></span>
+    <span id="poseInfo">X —   Y —   高 —</span>
     <span id="floorHint">楼层 —</span>
     <span id="session" class="session">—</span>
   </div>
-  <div id="hint">局域网只读 · 地图在板子上累积 · 实时/切片只影响本机显示</div>
+  <div id="hint">局域网只读 · 地图在板子上累积</div>
   <canvas id="c"></canvas>
+  <script type="importmap">
+    { "imports": { "three": "/three-shim.js" } }
+  </script>
   <script src="/three.min.js"></script>
-  <script src="/viewer.js"></script>
+  <script src="/viewer.js?v=65"></script>
 </body>
 </html>
