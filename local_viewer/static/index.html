@@ -43,6 +43,7 @@
 
     <label class="chk"><input type="checkbox" id="follow" checked /> 跟随设备</label>
     <button type="button" id="fit">看全图</button>
+    <button type="button" id="reset" title="清除点云与轨迹，并把当前位置和朝向设为地图原点">重置</button>
     <button type="button" id="saveRec" title="把当前点云和轨迹保存到本机">保存</button>
     <button type="button" id="replayBtn" title="选择已保存的文件进行回放">回放</button>
     <input type="file" id="replayFile" accept=".bin,application/octet-stream" hidden />
@@ -63,12 +64,12 @@
     <span id="floorHint">楼层 —</span>
     <span id="session" class="session">—</span>
   </div>
-  <div id="hint">局域网只读 · 地图在板子上累积</div>
+  <div id="hint">局域网只读 · 已收到的点留在本页</div>
   <canvas id="c"></canvas>
   <script type="importmap">
     { "imports": { "three": "/three-shim.js" } }
   </script>
   <script src="/three.min.js"></script>
-  <script src="/viewer.js?v=65"></script>
+  <script src="/viewer.js?v=68"></script>
 </body>
 </html>

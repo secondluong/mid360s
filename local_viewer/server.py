@@ -25,7 +25,7 @@ from typing import Optional, Set
 import numpy as np
 from aiohttp import WSMsgType, web
 
-from protocol import KIND_DELTA, KIND_SNAPSHOT, MAGIC, pack_delta, pack_live, pack_snapshot
+from protocol import KIND_DELTA, KIND_SNAPSHOT, MAGIC, pack_delta, pack_snapshot
 from voxel_map import VoxelMap
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -54,6 +54,41 @@ DELTA_HZ = float(env("LOCAL_VIEWER_DELTA_HZ", "8"))
 DEVICE_ID = env("MYVIEW_DEVICE_ID", "lidar-t6-mid360-01")
 
 
+def yaw_from_quat(q) -> float:
+    x, y, z, w = (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+class Rebase:
+    """Display frame: the pose at reset becomes the origin, heading +X.
+
+    Point-LIO keeps its own origin. Only the page's cloud and trajectory move.
+    """
+
+    def __init__(self, origin, yaw: float):
+        self.origin = np.asarray(origin, dtype=np.float64).reshape(3)
+        self.yaw = float(yaw)
+        self._c = math.cos(-self.yaw)
+        self._s = math.sin(-self.yaw)
+
+    @classmethod
+    def from_pose(cls, p, q) -> "Rebase":
+        return cls(p, yaw_from_quat(q))
+
+    def points(self, xyz: np.ndarray) -> np.ndarray:
+        d = np.asarray(xyz, dtype=np.float64).reshape(-1, 3) - self.origin
+        x = d[:, 0] * self._c - d[:, 1] * self._s
+        y = d[:, 0] * self._s + d[:, 1] * self._c
+        return np.stack([x, y, d[:, 2]], axis=1).astype(np.float32)
+
+    def quat(self, q) -> list:
+        yaw = yaw_from_quat(q) - self.yaw
+        return [0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)]
+
+    def apply_pose(self, p, q):
+        return self.points(np.asarray(p, dtype=np.float64).reshape(1, 3))[0].tolist(), self.quat(q)
+
+
 class Hub:
     def __init__(self, voxel: float, max_points: int):
         self.map = VoxelMap(voxel=voxel, max_points=max_points)
@@ -67,8 +102,13 @@ class Hub:
         self.ready = False
         self._last_odom_seq: Optional[int] = None
         self._last_odom_at: Optional[float] = None
+        self._raw_pose = None
+        self._rebase: Optional[Rebase] = None
+        self._inflight = []
+        self._inflight_keys = set()
         self.cloud_frames = 0
         self.pose_frames = 0
+        self._catchup = False
 
     def bump_session(self, reason: str) -> None:
         with self._lock:
@@ -78,6 +118,10 @@ class Hub:
             self.ready = False
             self._last_odom_seq = None
             self.pose = None
+            if reason == "pointlio-restart":
+                self._rebase = None
+            self._inflight.clear()
+            self._inflight_keys.clear()
         self.map.clear()
         self._broadcast_text(
             {
@@ -87,6 +131,32 @@ class Hub:
                 "t": time.time(),
             }
         )
+
+    def rebase_points(self, xyz: np.ndarray):
+        if self._rebase is None or xyz is None or len(xyz) == 0:
+            return xyz
+        return self._rebase.points(xyz)
+
+    def reset_map(self) -> bool:
+        """Clear the page cloud and put the current pose at the origin, facing +X."""
+        raw = self._raw_pose
+        self.bump_session("recalibrate")
+        if not raw:
+            return False
+        self._rebase = Rebase.from_pose(raw["p"], raw["q"])
+        pose = {
+            "type": "pose",
+            "t": time.time(),
+            "p": [0.0, 0.0, 0.0],
+            "q": [0.0, 0.0, 0.0, 1.0],
+            "init": 1,
+            "session": self.session,
+        }
+        self.pose = pose
+        self.ready = True
+        self.map.add_pose(0.0, 0.0, 0.0)
+        self.on_pose(pose)
+        return True
 
     def add_client(self, ws: web.WebSocketResponse) -> None:
         with self._lock:
@@ -113,21 +183,69 @@ class Hub:
             pass
 
     def on_new_voxels(self, xyz: np.ndarray) -> None:
-        if xyz is None or len(xyz) == 0:
+        # Kept in the display map and dripped to the page. Queueing every
+        # delta fills a slow mesh and the points get dropped before it draws them.
+        return
+
+    def take_cloud_chunk(self, limit: int = 4000):
+        """Newest voxels not already in flight. Kept until the page acks them."""
+        if len(self._inflight) >= 3:
+            return None
+        keys, pts = self.map.newest(limit, self._inflight_keys)
+        if len(pts) == 0:
+            return None
+        return keys, pts
+
+    def note_inflight(self, keys, pts: np.ndarray, nclients: int) -> None:
+        self._inflight.append(
+            {
+                "keys": keys,
+                "pts": pts,
+                "need": max(1, int(nclients)),
+                "got": 0,
+                "at": time.time(),
+            }
+        )
+        self._inflight_keys.update(keys)
+
+    def ack_cloud(self) -> None:
+        if not self._inflight:
             return
-        self._broadcast_bin(pack_delta(xyz))
+        item = self._inflight[0]
+        item["got"] += 1
+        if item["got"] < item["need"]:
+            return
+        self._inflight.pop(0)
+        for key in item["keys"]:
+            self._inflight_keys.discard(key)
+        self.map.discard_points(item["pts"])
+
+    def expire_inflight(self, timeout: float = 4.0) -> bool:
+        """A frame the page never acked stays in the map and can be sent again."""
+        if not self._inflight:
+            return False
+        if time.time() - self._inflight[0]["at"] < timeout:
+            return False
+        item = self._inflight.pop(0)
+        for key in item["keys"]:
+            self._inflight_keys.discard(key)
+        return True
 
     def on_live_cloud(self, xyz: np.ndarray, stamp: float) -> None:
-        if xyz is None or len(xyz) == 0:
-            return
-        pts = np.asarray(xyz, dtype=np.float32).reshape(-1, 3)
-        if len(pts) > 12000:
-            pts = pts[np.linspace(0, len(pts) - 1, 12000, dtype=np.int32)]
-        self._broadcast_bin(pack_live(pts, stamp))
+        # A persist page already keeps delivered voxels. Repeating the whole
+        # scan is what filled the mesh at the venue.
+        return
+
+    def take_catchup(self) -> bool:
+        with self._lock:
+            need = self._catchup
+            self._catchup = False
+            return need
 
     def on_pose(self, pose: dict) -> None:
+        # Latest pose only. A queue of poses behind a point frame is the
+        # trajectory lag on a slow mesh.
         self.pose = pose
-        self._broadcast_text(pose)
 
     def snapshot_bytes(self) -> bytes:
         pts, traj = self.map.snapshot()
@@ -179,7 +297,6 @@ def attach_ros(hub: Hub) -> None:
     from std_msgs.msg import Bool as BoolMsg
 
     last_pose_t = [0.0]
-    last_live_t = [0.0]
     pending_delta = []
     last_delta_t = [0.0]
     delta_lock = threading.Lock()
@@ -195,10 +312,11 @@ def attach_ros(hub: Hub) -> None:
         if not chunks:
             return
         xyz = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
-        # cap a single WS frame
-        if len(xyz) > 40000:
-            xyz = xyz[np.linspace(0, len(xyz) - 1, 40000, dtype=np.int32)]
-        hub.on_new_voxels(xyz)
+        # One frame stays small enough for a mesh hop. Every voxel is queued
+        # or left in the map; nothing is dropped on the floor.
+        step = 8000
+        for i in range(0, len(xyz), step):
+            hub.on_new_voxels(xyz[i : i + step])
 
     def on_cloud(msg: PointCloud2):
         names = {f.name for f in msg.fields}
@@ -207,12 +325,9 @@ def attach_ros(hub: Hub) -> None:
         if not rows:
             return
         xyz = np.asarray(rows, dtype=np.float32).reshape(-1, 3)
+        xyz = hub.rebase_points(xyz)
         added = hub.map.add_points(xyz)
         hub.cloud_frames += 1
-        now = time.time()
-        if now - last_live_t[0] >= 0.12:
-            last_live_t[0] = now
-            hub.on_live_cloud(xyz, msg.header.stamp.to_sec() or now)
         if len(added):
             with delta_lock:
                 pending_delta.append(added)
@@ -233,15 +348,20 @@ def attach_ros(hub: Hub) -> None:
         last_pose_t[0] = now
         p = msg.pose.pose.position
         o = msg.pose.pose.orientation
+        raw_p = [p.x, p.y, p.z]
+        raw_q = [o.x, o.y, o.z, o.w]
+        hub._raw_pose = {"p": raw_p, "q": raw_q}
+        if hub._rebase is not None:
+            raw_p, raw_q = hub._rebase.apply_pose(raw_p, raw_q)
         hub.ready = True
         hub.pose_frames += 1
-        hub.map.add_pose(p.x, p.y, p.z)
+        hub.map.add_pose(raw_p[0], raw_p[1], raw_p[2])
         hub.on_pose(
             {
                 "type": "pose",
                 "t": msg.header.stamp.to_sec(),
-                "p": [p.x, p.y, p.z],
-                "q": [o.x, o.y, o.z, o.w],
+                "p": raw_p,
+                "q": raw_q,
                 "init": 1,
                 "session": hub.session,
             }
@@ -280,7 +400,6 @@ def start_demo(hub: Hub, stop: threading.Event) -> None:
             xyz = np.asarray(wall, dtype=np.float32)
             added = hub.map.add_points(xyz)
             hub.cloud_frames += 1
-            hub.on_live_cloud(xyz, time.time())
             if len(added):
                 hub.on_new_voxels(added)
             hub.ready = True
@@ -310,67 +429,94 @@ def build_app(hub: Hub) -> web.Application:
     async def api_status(_request):
         return web.json_response(hub.status())
 
+    async def api_reset(_request):
+        hub.reset_map()
+        return web.json_response({"ok": True, "session": hub.session})
+
     async def ws_handler(request):
         ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024, heartbeat=20.0)
         await ws.prepare(request)
         hub.add_client(ws)
         try:
             await ws.send_str(json.dumps(hub.hello(), separators=(",", ":")))
-            snap = hub.snapshot_bytes()
-            await ws.send_bytes(snap)
-            # Sole page: these voxels are on screen now, so the board can drop
-            # them. Queued deltas stay; the page ignores ones it already has.
-            # With another page still open, keep the remainder until that
-            # page has been sent it too.
-            if hub.client_count() == 1:
-                hub.forget_sent(snap)
             if hub.pose:
                 await ws.send_str(json.dumps(hub.pose, separators=(",", ":")))
             async for msg in ws:
                 if msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.ERROR):
                     break
-                # viewers are receive-only
+                if msg.type == WSMsgType.TEXT:
+                    try:
+                        data = json.loads(msg.data)
+                    except Exception:
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    if data.get("type") == "reset":
+                        hub.reset_map()
+                    elif data.get("type") == "ack":
+                        hub.ack_cloud()
         finally:
             hub.remove_client(ws)
         return ws
 
     async def broadcaster(app_inner):
+        last_pose_t = 0.0
         try:
             while True:
-                try:
-                    kind, payload = hub.pending().get_nowait()
-                except queue.Empty:
+                with hub._lock:
+                    clients = [ws for ws in hub._clients if not ws.closed]
+                if not clients:
+                    hub._inflight.clear()
+                    hub._inflight_keys.clear()
                     await asyncio_sleep()
                     continue
-                dead = []
-                sent = 0
-                with hub._lock:
-                    clients = list(hub._clients)
-                for ws in clients:
-                    if ws.closed:
-                        dead.append(ws)
-                        continue
+                # Session notices first, then the newest pose, then one small
+                # cloud chunk. The chunk stays on the board until the page acks.
+                texts = []
+                while True:
                     try:
-                        if kind == "text":
-                            await ws.send_str(payload)
-                        else:
-                            await ws.send_bytes(payload)
+                        kind, payload = hub.pending().get_nowait()
+                    except queue.Empty:
+                        break
+                    if kind == "text":
+                        texts.append(payload)
+                backlog = max((_ws_backlog(ws) for ws in clients), default=0)
+                for payload in texts:
+                    dead = await _send_text(hub, clients, payload)
+                    clients = [ws for ws in clients if ws not in dead]
+                now = time.time()
+                # Poses stay ahead of the cloud unless the link is already full.
+                if hub.pose and clients and backlog < 400 * 1024 and now - last_pose_t >= 0.1:
+                    dead = await _send_text(
+                        hub, clients, json.dumps(hub.pose, separators=(",", ":"))
+                    )
+                    clients = [ws for ws in clients if ws not in dead]
+                    last_pose_t = now
+                if not clients or backlog >= 160 * 1024:
+                    await asyncio_sleep()
+                    continue
+                hub.expire_inflight()
+                got = hub.take_cloud_chunk(4000)
+                if got is None:
+                    await asyncio_sleep()
+                    continue
+                keys, chunk = got
+                payload = pack_delta(chunk)
+                hub.note_inflight(keys, chunk, len(clients))
+                sent = 0
+                for ws in clients:
+                    try:
+                        await ws.send_bytes(payload)
                         sent += 1
                     except Exception:
-                        dead.append(ws)
-                for ws in dead:
-                    hub.remove_client(ws)
-                # Forget a cloud frame only after every current page has it.
-                # Live scans (kind 3) are not part of the persistent map.
-                if (
-                    sent
-                    and not dead
-                    and kind == "bin"
-                    and len(payload) > 4
-                    and payload[:4] == MAGIC
-                    and payload[4] in (KIND_SNAPSHOT, KIND_DELTA)
-                ):
-                    hub.forget_sent(payload)
+                        hub.remove_client(ws)
+                if sent == 0 and hub._inflight and hub._inflight[-1]["pts"] is chunk:
+                    item = hub._inflight.pop()
+                    for key in item["keys"]:
+                        hub._inflight_keys.discard(key)
+                elif sent and hub._inflight and hub._inflight[-1]["pts"] is chunk:
+                    hub._inflight[-1]["need"] = sent
+                await asyncio_sleep()
         except asyncio.CancelledError:
             return
 
@@ -384,6 +530,7 @@ def build_app(hub: Hub) -> web.Application:
 
     app.router.add_get("/", index)
     app.router.add_get("/api/status", api_status)
+    app.router.add_post("/api/reset", api_reset)
     app.router.add_get("/ws", ws_handler)
     app.router.add_static("/", STATIC_DIR, name="static")
     app.on_startup.append(on_start)
@@ -393,6 +540,28 @@ def build_app(hub: Hub) -> web.Application:
 
 async def asyncio_sleep():
     await asyncio.sleep(0.01)
+
+
+async def _send_text(hub: Hub, clients, payload: str):
+    dead = []
+    for ws in clients:
+        try:
+            await ws.send_str(payload)
+        except Exception:
+            dead.append(ws)
+            hub.remove_client(ws)
+    return dead
+
+
+def _ws_backlog(ws) -> int:
+    writer = getattr(ws, "_writer", None)
+    transport = getattr(writer, "transport", None) if writer is not None else None
+    if transport is None:
+        return 0
+    try:
+        return int(transport.get_write_buffer_size())
+    except Exception:
+        return 0
 
 
 def float_cloud(payload: bytes):

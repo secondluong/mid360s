@@ -54,7 +54,7 @@
   trajLine.frustumCulled = false;
   scene.add(trajLine);
 
-  const ICON_H = 0.85;
+  const ICON_H = 1.7;
   const ICON_BASE = "/fireman/";
   const GIFT_STAND_FBX = ["消防灭火防护服（站立）.FBX"];
   const GIFT_RUN_FBX = ["消防灭火防护服（跑步）.FBX"];
@@ -475,6 +475,7 @@
   let pose = [0, 0, 0];
   let follow = true;
   let session = "";
+  let socket = null;
   let needFit = true;
   let paused = false;
   let viewDirty = true;
@@ -1076,6 +1077,12 @@
     }
   }
 
+  function ackCloud() {
+    if (socket && socket.readyState === 1) {
+      try { socket.send(JSON.stringify({ type: "ack" })); } catch (e) { /* closed */ }
+    }
+  }
+
   function onBin(buf) {
     const frame = parseLmap(buf);
     if (!frame) return;
@@ -1089,8 +1096,10 @@
         refreshFloors(true);
         if (fresh) needFit = true;
       }
+      ackCloud();
     } else if (frame.kind === 2) {
       setPersist(frame.pts, false);
+      ackCloud();
     } else if (frame.kind === 3) {
       liveChunks.push({ t: frame.stamp || Date.now() / 1000, xyz: frame.pts });
       pruneLive();
@@ -1101,12 +1110,14 @@
   function connect() {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    socket = ws;
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
       elConn.className = "pill on";
       elConn.textContent = "已连接";
     };
     ws.onclose = () => {
+      if (socket === ws) socket = null;
       elConn.className = "pill off";
       elConn.textContent = "已断开 · 重连中";
       setTimeout(connect, 1200);
@@ -1253,6 +1264,10 @@
     elFollow.checked = false;
     applyView();
     fit();
+  });
+  document.getElementById("reset").addEventListener("click", () => {
+    if (!window.confirm("清除全部点云与轨迹，并重新开始累积？")) return;
+    fetch("/api/reset", { method: "POST" }).catch(() => {});
   });
 
   const REPLAY_WALK_MPS = 0.8;

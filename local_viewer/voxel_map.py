@@ -114,6 +114,22 @@ class VoxelMap:
                 self._last_traj = self._traj[-1]
             return True
 
+    def newest(self, limit: int, skip: set) -> Tuple[list, np.ndarray]:
+        """Newest voxel centers that are not already on the wire."""
+        chosen = []
+        pts = []
+        with self._lock:
+            for key in reversed(self._order):
+                if key in skip or key not in self._keys:
+                    continue
+                chosen.append(key)
+                pts.append(self._keys[key])
+                if len(chosen) >= limit:
+                    break
+        if not chosen:
+            return [], np.zeros((0, 3), dtype=np.float32)
+        return chosen, np.asarray(pts, dtype=np.float32)
+
     def snapshot(self) -> Tuple[np.ndarray, np.ndarray]:
         with self._lock:
             if self._keys:
