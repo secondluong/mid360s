@@ -2,11 +2,12 @@
 # Container entrypoint for the MyView Lidar ROS bridge (T6 + Mid-360).
 #
 # Boot-order agnostic flow:
-#   1. Wait for WiFi (LAN) + 4G (WAN), apply 3-way route split.
-#   2. Wait for MyView TCP via 4G — does not depend on the lidar.
+#   1. Wait for WiFi (LAN), apply 3-way route split.
+#   2. roscore + on-board viewer + MyView relay supervisor (never blocks
+#      on MyView; the settings page at :8080 decides where to push).
 #   3. Wait for Mid-360 + route verify.
 #   4. Start roslaunch, settle, restart stack.
-#   5. Network watchdog + relay.
+#   5. Network watchdog.
 
 set -euo pipefail
 
@@ -26,21 +27,24 @@ source "${SCRIPTS_DIR}/net-common.sh"
 require_ip_or_exit
 
 LIDAR_IP="${LIDAR_IP:-192.168.1.12}"
+# The :8080 settings page overrides .env; saving a new lidar IP there
+# restarts the container so everything below picks it up.
+LIDAR_IP="$(python3 "${SCRIPTS_DIR}/myview_settings.py" lidar-ip 2>/dev/null || echo "${LIDAR_IP}")"
 PC_IP="${PC_IP:-192.168.1.50}"
+export LIDAR_IP PC_IP
 IMU_TOPIC="${RELAY_IMU_TOPIC:-/livox/imu}"
 DRIVER_CLOUD_TOPIC="${DRIVER_CLOUD_TOPIC:-/livox/lidar}"
 CLOUD_TOPIC="${DRIVER_CLOUD_TOPIC}"
 ODOM_TOPIC="${RELAY_ODOM_TOPIC:-/pointlio/odom}"
 LAN_IF="${LAN_INTERFACE:-auto}"
 WAN_IF="${WAN_INTERFACE:-auto}"
-MYVIEW_VIA="${MYVIEW_VIA:-auto}"
+MYVIEW_VIA="${MYVIEW_VIA:-wifi-first}"
+export MYVIEW_VIA SCRIPTS_DIR
 DRIVER_NODE="${DRIVER_NODE:-/livox_lidar_publisher2}"
 LIO_NODE="${LIO_NODE:-/laserMapping}"
 
 LIDAR_WAIT_TIMEOUT_S="${LIDAR_WAIT_TIMEOUT_S:-0}"
 LAN_WAIT_TIMEOUT_S="${LAN_WAIT_TIMEOUT_S:-30}"
-WAN_WAIT_TIMEOUT_S="${WAN_WAIT_TIMEOUT_S:-120}"
-MYVIEW_WAIT_TIMEOUT_S="${MYVIEW_WAIT_TIMEOUT_S:-120}"
 TOPIC_WAIT_TIMEOUT_S="${TOPIC_WAIT_TIMEOUT_S:-120}"
 LIDAR_UDP_WARMUP_S="${LIDAR_UDP_WARMUP_S:-5}"
 LIDAR_CONCURRENT_WARMUP_S="${LIDAR_CONCURRENT_WARMUP_S:-10}"
@@ -50,10 +54,9 @@ IMU_SETTLE_S="${IMU_SETTLE_S:-8}"
 LIO_RESTART_ON_READY="${LIO_RESTART_ON_READY:-true}"
 RELAY_START_EARLY="${RELAY_START_EARLY:-true}"
 LOCAL_VIEWER="${LOCAL_VIEWER:-true}"
-MYVIEW_RELAY="${MYVIEW_RELAY:-false}"
+RELAY_SUPERVISOR_INTERVAL_S="${RELAY_SUPERVISOR_INTERVAL_S:-3}"
 LIDAR_WATCHDOG_INTERVAL_S="${LIDAR_WATCHDOG_INTERVAL_S:-5}"
 FIX_ROUTES="${FIX_ROUTES:-true}"
-MYVIEW_WAIT="${MYVIEW_WAIT:-true}"
 ROUTE_FIX_INTERVAL_S="${ROUTE_FIX_INTERVAL_S:-5}"
 BOOT_ROUTE_GUARD_S="${BOOT_ROUTE_GUARD_S:-120}"
 BOOT_ROUTE_GUARD_INTERVAL_S="${BOOT_ROUTE_GUARD_INTERVAL_S:-1}"
@@ -145,6 +148,7 @@ start_boot_route_guard() {
   ROUTE_GUARD_PID=$!
 }
 RELAY_PID=""
+RELAY_SUP_PID=""
 VIEWER_PID=""
 ROSCORE_PID=""
 LAUNCH_PID=""
@@ -160,13 +164,16 @@ source "/opt/ros/${ROS_DISTRO}/setup.bash"
 source "${CATKIN_WS}/devel/setup.bash"
 
 myview_host() {
-  echo "${MYVIEW_SERVER_URL:-}" | sed -E 's|^wss?://([^:/]+).*|\1|'
+  local MYVIEW_HOST="" MYVIEW_PORT="" MYVIEW_ENABLED="" MYVIEW_SERVER_URL="" LIDAR_IP=""
+  eval "$(python3 "${SCRIPTS_DIR}/myview_settings.py" shell 2>/dev/null || true)"
+  echo "${MYVIEW_HOST}"
 }
 
-myview_port() {
-  local port
-  port="$(echo "${MYVIEW_SERVER_URL:-}" | sed -E 's|^wss?://[^:/]+:?([0-9]+)?.*|\1|')"
-  echo "${port:-3000}"
+legacy_myview_via() {
+  case "${MYVIEW_VIA}" in
+    wan|WAN|lan|LAN|auto) return 0 ;;
+  esac
+  return 1
 }
 
 apply_routes() {
@@ -209,8 +216,10 @@ log_lidar_route_status() {
 
 myview_route_ok() {
   local host dev expect
+  # wifi-first: fix-routes.sh picks and pins the uplink itself.
+  legacy_myview_via || return 0
   host="$(myview_host || true)"
-  if [ -z "${host}" ] || [ "${host}" = "${MYVIEW_SERVER_URL:-}" ]; then
+  if [ -z "${host}" ]; then
     return 0
   fi
   expect="$(expected_myview_if)"
@@ -227,6 +236,7 @@ myview_route_ok() {
 
 log_myview_route_status() {
   local host dev expect
+  legacy_myview_via || return 0
   host="$(myview_host || true)"
   expect="$(expected_myview_if)"
   dev="$(route_dev_for "${host}" 2>/dev/null || true)"
@@ -328,28 +338,6 @@ wait_for_lan() {
   apply_routes true
 }
 
-wait_for_wan() {
-  local attempt=0 detected=""
-  echo "[entrypoint] waiting for 4G/WAN IPv4 (timeout=${WAN_WAIT_TIMEOUT_S}s)…"
-  while [ "${attempt}" -lt "${WAN_WAIT_TIMEOUT_S}" ]; do
-    if detected="$(detect_wan_interface)" && iface_has_ipv4 "${detected}"; then
-      export_wan_interface "${detected}"
-      WAN_IF="${detected}"
-      echo "[entrypoint] WAN/4G ready on ${detected}"
-      apply_routes true
-      return 0
-    fi
-    if [ $((attempt % 5)) -eq 0 ]; then
-      echo "[entrypoint] still waiting for 4G — current IPv4 interfaces:"
-      log_ipv4_interfaces "[entrypoint]   "
-    fi
-    attempt=$((attempt + 1))
-    sleep 2
-  done
-  echo "[entrypoint] WARN: 4G/WAN not up yet — MyView will retry; offline buffer will catch up"
-  apply_routes true
-}
-
 wait_for_lidar() {
   echo "[entrypoint] waiting for Mid-360 at ${LIDAR_IP} via ${LIDAR_IF} (host=${PC_IP}, timeout=${LIDAR_WAIT_TIMEOUT_S}s, 0=forever)…"
   local start attempt now elapsed had_pc_ip=false
@@ -404,39 +392,6 @@ wait_for_lidar() {
     fi
     sleep 2
   done
-}
-
-wait_for_myview() {
-  if [ "${MYVIEW_WAIT}" != "true" ]; then
-    return 0
-  fi
-  local host port attempt
-  host="$(myview_host)"
-  port="$(myview_port)"
-  if [ -z "${host}" ] || [ "${host}" = "${MYVIEW_SERVER_URL:-}" ]; then
-    echo "[entrypoint] WARN: could not parse MYVIEW_SERVER_URL — skipping MyView wait"
-    return 0
-  fi
-  echo "[entrypoint] waiting for MyView ${host}:${port} via $(myview_via_role "${host}") (timeout=${MYVIEW_WAIT_TIMEOUT_S}s)…"
-  apply_routes true
-  attempt=0
-  while [ "${attempt}" -lt "${MYVIEW_WAIT_TIMEOUT_S}" ]; do
-    refresh_ifaces
-    apply_routes true
-    if timeout 3 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
-      if myview_route_ok; then
-        echo "[entrypoint] MyView TCP reachable via $(expected_myview_if)"
-        return 0
-      fi
-      log_myview_route_status
-    fi
-    if [ $((attempt % 5)) -eq 0 ] && [ "${attempt}" -gt 0 ]; then
-      echo "[entrypoint] still waiting for MyView ${host}:${port}…"
-    fi
-    attempt=$((attempt + 1))
-    sleep 2
-  done
-  echo "[entrypoint] WARN: MyView not reachable yet — relay will keep retrying WebSocket"
 }
 
 wait_for_roscore() {
@@ -510,17 +465,69 @@ stamp_livox_config() {
     || echo "[entrypoint] WARN: stamp-livox-config failed"
 }
 
+relay_alive() {
+  [ -n "${RELAY_PID}" ] && kill -0 "${RELAY_PID}" 2>/dev/null
+}
+
 start_relay() {
-  if [ "${MYVIEW_RELAY}" != "true" ]; then
-    return 0
-  fi
-  if [ -n "${RELAY_PID}" ] && kill -0 "${RELAY_PID}" 2>/dev/null; then
-    return 0
-  fi
-  echo "[entrypoint] starting relay → MyView ${MYVIEW_SERVER_URL:-}"
-  cd "${RELAY_DIR}"
-  python3 relay.py &
+  relay_alive && return 0
+  local MYVIEW_HOST="" MYVIEW_PORT="" MYVIEW_ENABLED="" MYVIEW_SERVER_URL="" LIDAR_IP=""
+  eval "$(python3 "${SCRIPTS_DIR}/myview_settings.py" shell 2>/dev/null || true)"
+  echo "[relay-sup] starting relay → MyView ${MYVIEW_SERVER_URL}"
+  (cd "${RELAY_DIR}" && exec python3 relay.py) &
   RELAY_PID=$!
+}
+
+stop_relay() {
+  if relay_alive; then
+    kill -TERM "${RELAY_PID}" 2>/dev/null || true
+    local _
+    for _ in 1 2 3 4 5; do
+      relay_alive || break
+      sleep 1
+    done
+    kill -KILL "${RELAY_PID}" 2>/dev/null || true
+    wait "${RELAY_PID}" 2>/dev/null || true
+  fi
+  RELAY_PID=""
+}
+
+# The settings page writes myview.json and fix-routes writes route.json.
+# Either changing (or the relay dying) means reconnecting: a socket opened on
+# the old uplink keeps its old source address after the route moves.
+relay_supervisor() {
+  trap 'stop_relay; exit 0' TERM INT
+  local sig="" new enabled
+  echo "[relay-sup] watching MyView settings (every ${RELAY_SUPERVISOR_INTERVAL_S}s)"
+  while true; do
+    new="$(python3 "${SCRIPTS_DIR}/myview_settings.py" signature 2>/dev/null || echo "0|error")"
+    enabled="${new%%|*}"
+    if [ "${new}" != "${sig}" ]; then
+      if [ -n "${sig}" ] && relay_alive; then
+        echo "[relay-sup] MyView settings or uplink changed — restarting relay"
+      fi
+      stop_relay
+      if [ "${enabled}" != "1" ] && [ -n "${sig}" ]; then
+        echo "[relay-sup] MyView push disabled"
+      fi
+      sig="${new}"
+    fi
+    if [ "${enabled}" = "1" ] && ! relay_alive; then
+      if [ -n "${RELAY_PID}" ]; then
+        echo "[relay-sup] relay exited — restarting"
+      fi
+      start_relay
+    fi
+    sleep "${RELAY_SUPERVISOR_INTERVAL_S}" || true
+  done
+}
+
+start_relay_supervisor() {
+  if [ -n "${RELAY_SUP_PID}" ] && kill -0 "${RELAY_SUP_PID}" 2>/dev/null; then
+    return 0
+  fi
+  relay_supervisor &
+  RELAY_SUP_PID=$!
 }
 
 start_local_viewer() {
@@ -617,9 +624,11 @@ cleanup() {
   if [ -n "${ROUTE_GUARD_PID}" ] && kill -0 "${ROUTE_GUARD_PID}" 2>/dev/null; then
     kill -TERM "${ROUTE_GUARD_PID}" 2>/dev/null || true
   fi
-  if [ -n "${RELAY_PID}" ] && kill -0 "${RELAY_PID}" 2>/dev/null; then
-    kill -TERM "${RELAY_PID}" 2>/dev/null || true
+  if [ -n "${RELAY_SUP_PID}" ] && kill -0 "${RELAY_SUP_PID}" 2>/dev/null; then
+    kill -TERM "${RELAY_SUP_PID}" 2>/dev/null || true
   fi
+  # The supervisor stops its relay on TERM; this catches a relay it left behind.
+  pkill -TERM -f "python3 relay.py" 2>/dev/null || true
   if [ -n "${VIEWER_PID}" ] && kill -0 "${VIEWER_PID}" 2>/dev/null; then
     kill -TERM "${VIEWER_PID}" 2>/dev/null || true
   fi
@@ -636,27 +645,19 @@ cleanup() {
 }
 trap cleanup TERM INT
 
-# ── 1. WiFi + (optional 4G) + routes ────────────────────────────────
+# ── 1. WiFi + routes (4G is picked up whenever it appears) ──────────
 wait_for_lan
-if [ "${MYVIEW_RELAY}" = "true" ]; then
-  wait_for_wan
-fi
 start_link_monitor
 start_boot_route_guard
 
 # ── 2. Stamp Mid-360 JSON ───────────────────────────────────────────
 stamp_livox_config
 
-# ── 3. MyView via 4G (optional) ─────────────────────────────────────
-if [ "${MYVIEW_RELAY}" = "true" ]; then
-  wait_for_myview
-fi
-
-# ── 3b. Early roscore + local viewer (+ optional cloud relay) ───────
+# ── 3. Early roscore + local viewer (+ MyView relay supervisor) ─────
 start_roscore || cleanup
 start_local_viewer
 if [ "${RELAY_START_EARLY}" = "true" ]; then
-  start_relay
+  start_relay_supervisor
 fi
 
 # ── 4. Mid-360 ready ────────────────────────────────────────────────
@@ -705,17 +706,11 @@ MEM_GUARD_PID=$!
 
 # ── 9. Keep the on-board viewer as the main process ─────────────────
 start_local_viewer
-if [ "${MYVIEW_RELAY}" = "true" ]; then
-  start_relay
-fi
+start_relay_supervisor
 if [ -n "${VIEWER_PID}" ]; then
   wait "${VIEWER_PID}"
   RC=$?
   echo "[entrypoint] local viewer exited rc=${RC}"
-elif [ -n "${RELAY_PID}" ]; then
-  wait "${RELAY_PID}"
-  RC=$?
-  echo "[entrypoint] relay exited rc=${RC}"
 else
   wait "${LAUNCH_PID}"
   RC=$?

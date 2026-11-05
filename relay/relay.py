@@ -59,6 +59,9 @@ import websocket  # websocket-client
 import encoder
 from offline_buffer import OfflineRingBuffer
 
+sys.path.insert(0, os.environ.get("SCRIPTS_DIR", "/opt/myview-relay/scripts"))
+import myview_settings  # noqa: E402
+
 
 # ── Config (env-driven so docker-compose owns it) ─────────────────────
 
@@ -78,9 +81,18 @@ def env_bool(name: str, default: bool = False) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 # Manager URL: ws://host:port  (the relay appends the /ws/lidar query string).
-SERVER_URL    = env("MYVIEW_SERVER_URL", "ws://host.docker.internal:3000").rstrip("/")
-BRIDGE_TOKEN  = env("MYVIEW_BRIDGE_TOKEN", "")
-DEVICE_ID     = env("MYVIEW_DEVICE_ID", "lidar-mid360-01")
+# The on-board settings page (myview.json) wins over .env; the entrypoint
+# restarts the relay whenever it changes.
+SETTINGS      = myview_settings.load()
+SERVER_URL    = (myview_settings.server_url(SETTINGS)
+                 or env("MYVIEW_SERVER_URL", "ws://host.docker.internal:3000")).rstrip("/")
+BRIDGE_TOKEN  = SETTINGS.get("token") or ""
+DEVICE_ID     = SETTINGS.get("deviceId") or env("MYVIEW_DEVICE_ID", "lidar-mid360-01")
+
+# Live cloud budget. A raw 10 Hz Mid-360 scan is too much for 4G; poses and
+# mapSession frames are never throttled.
+CLOUD_HZ         = float(SETTINGS.get("cloudHz") or env("RELAY_CLOUD_HZ", "5"))
+CLOUD_MAX_POINTS = int(SETTINGS.get("cloudMaxPoints") or env("RELAY_CLOUD_MAX_POINTS", "8000"))
 
 # Topic names (overridable). Cloud defaults to Point-LIO world-frame
 # /pointlio/cloud_registered so it shares the odom frame.
@@ -142,10 +154,10 @@ def fix_routes() -> None:
         rospy.logwarn(f"[relay] fix-routes failed: {e}")
 
 
-def build_url() -> str:
+def build_url(with_token: bool = True) -> str:
     qs = f"role=producer&deviceId={quote_plus(DEVICE_ID)}"
     if BRIDGE_TOKEN:
-        qs += f"&token={quote_plus(BRIDGE_TOKEN)}"
+        qs += f"&token={quote_plus(BRIDGE_TOKEN) if with_token else '***'}"
     return f"{SERVER_URL}/ws/lidar?{qs}"
 
 
@@ -269,6 +281,9 @@ class Sender:
         self._dropped = 0
         self._sent_cloud = 0
         self._sent_text = 0
+        self._sent_pose = 0
+        self._last_error = ""
+        self._connected_at = 0.0
         self._buffered = 0
         self._catchup_sent = 0
         self._last_cloud_at = 0.0
@@ -414,7 +429,7 @@ class Sender:
 
     def _connect_once(self) -> bool:
         url = build_url()
-        rospy.loginfo(f"[relay] connecting to {url}")
+        rospy.loginfo(f"[relay] connecting to {build_url(with_token=False)}")
         try:
             ws = websocket.create_connection(
                 url,
@@ -426,6 +441,8 @@ class Sender:
             with self._ws_lock:
                 self._ws = ws
             self._connected = True
+            self._connected_at = time.time()
+            self._last_error = ""
             # A fresh consumer has no idea which world frame we are in.
             self._announce_pending = self._announce_text is not None
             pending = self._offline.pending() if self._offline else False
@@ -436,6 +453,7 @@ class Sender:
             return True
         except Exception as e:
             self._connected = False
+            self._last_error = f"连接失败：{e}"
             rospy.logwarn(f"[relay] connect failed: {e}")
             fix_routes()
             return False
@@ -455,9 +473,11 @@ class Sender:
                 ws.send(payload)
                 self._sent_text += 1
                 if '"type":"pose"' in payload:
+                    self._sent_pose += 1
                     self._last_pose_at = time.time()
             return True
         except Exception as e:
+            self._last_error = f"发送失败：{e}"
             rospy.logwarn(f"[relay] send failed: {e}; will reconnect")
             fix_routes()
             with self._ws_lock:
@@ -537,6 +557,21 @@ class Sender:
 
         rospy.loginfo("[relay] sender thread exiting")
 
+    def status_snapshot(self) -> dict:
+        return {
+            "connected": self._connected,
+            "connectedAt": self._connected_at or None,
+            "lastError": self._last_error,
+            "url": build_url(with_token=False),
+            "cloudFramesSent": self._sent_cloud,
+            "posesSent": self._sent_pose,
+            "textSent": self._sent_text,
+            "dropped": self._dropped,
+            "lastCloudAt": self._last_cloud_at or None,
+            "lastPoseAt": self._last_pose_at or None,
+            "offlinePending": bool(self._offline.pending()) if self._offline else False,
+        }
+
     def _maybe_log_stats(self):
         now = time.time()
         if now - self._last_log_at < 5.0:
@@ -582,6 +617,7 @@ class Relay:
         # synthetic status frames.
         self._last_ring_num  = 1
         self._last_point_count = 0
+        self._last_cloud_at = 0.0
 
     def _rebase_session(self, reason: str):
         session_id, reason, changed_at = self.session.bump(reason)
@@ -600,6 +636,10 @@ class Relay:
     # — PointCloud2 → ULDR binary (world-frame registered cloud preferred) —
 
     def on_cloud(self, msg: PointCloud2):
+        now = time.time()
+        if CLOUD_HZ > 0 and now - self._last_cloud_at < 1.0 / CLOUD_HZ:
+            return
+        self._last_cloud_at = now
         try:
             payload = self._encode_cloud(msg)
         except Exception as e:
@@ -634,6 +674,9 @@ class Relay:
             arr = np.zeros((0, 6), dtype=np.float32)
         else:
             arr = np.array(rows, dtype=np.float32)
+            if CLOUD_MAX_POINTS > 0 and n > CLOUD_MAX_POINTS:
+                arr = arr[:: int(np.ceil(n / CLOUD_MAX_POINTS))]
+                n = len(arr)
 
         # Slice columns out into the encoder's expected shape.
         col = 0
@@ -794,6 +837,13 @@ class StatusHeartbeat:
                 self.sender.post_text(txt)
             except Exception as e:
                 rospy.logwarn(f"[relay] status emit failed: {e}")
+            try:
+                st = self.sender.status_snapshot()
+                st["session"] = self.relay.session.current()
+                st["t"] = time.time()
+                myview_settings.write_json(myview_settings.RELAY_STATUS, st)
+            except Exception as e:
+                rospy.logwarn_throttle(30.0, f"[relay] status file write failed: {e}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -807,6 +857,7 @@ def main():
     rospy.loginfo("  imu topic         = %s", IMU_TOPIC)
     rospy.loginfo("  odom topic        = %s", ODOM_TOPIC)
     rospy.loginfo("  pose settle       = %.1fs", POSE_SETTLE_S)
+    rospy.loginfo("  live cloud        = %.1f Hz, <= %d pts/frame", CLOUD_HZ, CLOUD_MAX_POINTS)
     rospy.loginfo("  bridge_token      = %s",
                   "<set>" if BRIDGE_TOKEN else "<empty: relying on LAN-trust>")
     rospy.loginfo(

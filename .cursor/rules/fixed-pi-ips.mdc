@@ -12,7 +12,9 @@ Do **not** change these roles unless the user explicitly asks:
 | Ethernet | `LIDAR_INTERFACE` | host `192.168.1.50/24` | Mid-360 only, `never-default` |
 | Mid-360 | `LIDAR_IP` | `192.168.1.1XX` | XX = serial last two digits; `.env` example `192.168.1.12` is a placeholder |
 | WiFi STA | `LAN_INTERFACE` | DHCP from existing router | Local SSH / LAN only, not default route |
-| 4G | `WAN_INTERFACE` | carrier DHCP | Default route; MyView `/ws/lidar` (`MYVIEW_VIA=wan`) |
+| 4G | `WAN_INTERFACE` | carrier DHCP | Default route |
+
+MyView push (`/ws/lidar`) egress is `MYVIEW_VIA=wifi-first`: a host `/32` via WiFi when WiFi reaches MyView, otherwise via 4G when 4G reaches the internet. Only that `/32` moves; the default route roles above stay. The MyView IP/port come from the :8080 settings page (`data/settings/myview.json`), not `.env`.
 
 `PC_IP` means the **lidar ethernet** address as seen by Mid-360 (`192.168.1.50`), not the WiFi IP.
 

@@ -15,7 +15,9 @@ import json
 import math
 import os
 import queue
+import signal
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -27,6 +29,12 @@ from aiohttp import WSMsgType, web
 
 from protocol import KIND_DELTA, KIND_SNAPSHOT, MAGIC, pack_delta, pack_snapshot
 from voxel_map import VoxelMap
+
+SCRIPTS_DIR = os.environ.get("SCRIPTS_DIR", "/opt/myview-relay/scripts")
+if not os.path.isdir(SCRIPTS_DIR):
+    SCRIPTS_DIR = str(Path(__file__).resolve().parent.parent / "scripts")
+sys.path.insert(0, SCRIPTS_DIR)
+import myview_settings  # noqa: E402
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -433,6 +441,78 @@ def build_app(hub: Hub) -> web.Application:
         hub.reset_map()
         return web.json_response({"ok": True, "session": hub.session})
 
+    def myview_state() -> dict:
+        return {
+            "lidar": dict(
+                myview_settings.load_lidar(),
+                runningIp=os.environ.get("LIDAR_IP", ""),
+                odomReady=hub.ready,
+                cloudFrames=hub.cloud_frames,
+            ),
+            "settings": myview_settings.public_view(myview_settings.load()),
+            "route": myview_settings.read_json(myview_settings.ROUTE),
+            "relay": myview_settings.relay_status(),
+        }
+
+    def reselect_route() -> None:
+        script = os.path.join(SCRIPTS_DIR, "fix-routes.sh")
+        if os.environ.get("FIX_ROUTES", "true") != "true" or not os.access(script, os.X_OK):
+            return
+        try:
+            subprocess.run(
+                [script],
+                env=dict(os.environ, FIX_ROUTES_MYVIEW_FORCE="true"),
+                timeout=30,
+                check=False,
+                capture_output=True,
+            )
+        except Exception as e:
+            print(f"[viewer] fix-routes after MyView save failed: {e}", file=sys.stderr)
+
+    async def _json_body(request) -> dict:
+        try:
+            body = await request.json()
+        except Exception:
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    async def api_myview_get(_request):
+        return web.json_response(myview_state())
+
+    async def api_myview_save(request):
+        body = await _json_body(request)
+        saved, errors = myview_settings.save(body)
+        if errors:
+            return web.json_response({"ok": False, "errors": errors}, status=400)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, reselect_route)
+        return web.json_response(dict(myview_state(), ok=True))
+
+    async def api_lidar_save(request):
+        body = await _json_body(request)
+        before = os.environ.get("LIDAR_IP", "")
+        saved, errors = myview_settings.save_lidar(body)
+        if errors:
+            return web.json_response({"ok": False, "errors": errors}, status=400)
+        restart = saved["lidarIp"] != before and _in_bridge_container()
+        if restart:
+            # The driver config, lidar route and watchdog are all set up at
+            # container start. TERM to the entrypoint runs its cleanup and
+            # Docker's restart policy brings the stack back with the new IP.
+            print(f"[viewer] lidar IP {before} -> {saved['lidarIp']}: restarting container", flush=True)
+            asyncio.get_running_loop().call_later(1.0, os.kill, 1, signal.SIGTERM)
+        return web.json_response({"ok": True, "lidar": saved, "restarting": restart})
+
+    async def api_myview_test(request):
+        body = await _json_body(request)
+        body.pop("enabled", None)
+        candidate, errors = myview_settings.merge(body, dict(myview_settings.load(), enabled=False))
+        if errors:
+            return web.json_response({"ok": False, "errors": errors}, status=400)
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, myview_settings.test_connection, candidate)
+        return web.json_response(dict(result, ok=True))
+
     async def ws_handler(request):
         ws = web.WebSocketResponse(max_msg_size=16 * 1024 * 1024, heartbeat=20.0)
         await ws.prepare(request)
@@ -531,11 +611,24 @@ def build_app(hub: Hub) -> web.Application:
     app.router.add_get("/", index)
     app.router.add_get("/api/status", api_status)
     app.router.add_post("/api/reset", api_reset)
+    app.router.add_get("/api/myview", api_myview_get)
+    app.router.add_post("/api/myview", api_myview_save)
+    app.router.add_post("/api/myview/test", api_myview_test)
+    app.router.add_post("/api/lidar", api_lidar_save)
     app.router.add_get("/ws", ws_handler)
     app.router.add_static("/", STATIC_DIR, name="static")
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
     return app
+
+
+def _in_bridge_container() -> bool:
+    """PID 1 is our entrypoint, not the host init (e.g. --demo on a laptop)."""
+    try:
+        with open("/proc/1/cmdline", "rb") as f:
+            return b"entrypoint.sh" in f.read()
+    except OSError:
+        return False
 
 
 async def asyncio_sleep():

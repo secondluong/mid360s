@@ -1,4 +1,4 @@
-# NanoPC-T6: Mid-360 on ethernet, MyView cloud via 4G, WiFi STA for LAN.
+# NanoPC-T6: Mid-360 on ethernet, MyView push via WiFi (4G fallback), WiFi STA for LAN.
 # host network so Livox UDP and 4G/WiFi routes are not NATed.
 
 services:
@@ -33,6 +33,8 @@ services:
       - ./launch:/opt/myview-relay/launch:ro
       - ./entrypoint.sh:/opt/myview-relay/entrypoint.sh:ro
       - ./data/offline-buffer:/var/lib/myview-relay/offline-buffer
+      # MyView settings from the :8080 page, chosen uplink, relay status.
+      - ./data/settings:/var/lib/myview-relay/settings
       - ./data/gift:/opt/myview-relay/data/gift:ro
       - ./data/fireman:/opt/myview-relay/data/fireman:ro
     env_file:

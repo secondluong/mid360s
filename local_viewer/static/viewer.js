@@ -479,7 +479,6 @@
   let needFit = true;
   let paused = false;
   let viewDirty = true;
-  let replay = null;
 
   const ui = {
     cloud: true,
@@ -890,11 +889,8 @@
 
   function applyView() {
     const filtering = ui.horiz || (ui.section && ui.floor >= 0);
-    const replaySrc = replay ? (replay.cloud || new Float32Array(0)) : null;
     let n;
-    if (replaySrc) {
-      n = uploadFiltered(replaySrc);
-    } else if (ui.mode !== "persist") {
+    if (ui.mode !== "persist") {
       n = uploadFiltered(livePoints());
     } else if (filtering) {
       n = uploadFiltered(persistPos);
@@ -903,11 +899,10 @@
       uploadPersist(from);
       n = persistPos.length / 3;
     }
-    elMap.textContent = String((replay ? replay.pts.length : persistPos.length) / 3);
+    elMap.textContent = String(persistPos.length / 3);
     elVis.textContent = String(n);
-    const trajDraw = replay ? (replay.trajShown || new Float32Array(0)) : trajPos;
-    rebuildTrajRibbon(trajDraw);
-    elTraj.textContent = String(trajDraw.length / 3);
+    rebuildTrajRibbon(trajPos);
+    elTraj.textContent = String(trajPos.length / 3);
     points.visible = ui.cloud;
     device.visible = ui.device;
     trajLine.visible = ui.traj;
@@ -1059,16 +1054,13 @@
     if (msg.session) applySession(msg.session, msg.reason);
     if (msg.type === "hello") {
       if (msg.voxel > 0) mapVoxel = msg.voxel;
-      if (!replay) {
-        elReady.className = "pill " + (msg.ready ? "on" : "wait");
-        elReady.textContent = msg.ready ? "里程计就绪" : "等待里程计";
-      }
+      elReady.className = "pill " + (msg.ready ? "on" : "wait");
+      elReady.textContent = msg.ready ? "里程计就绪" : "等待里程计";
     } else if (msg.type === "mapSession") {
       elReady.className = "pill wait";
       elReady.textContent = "坐标系已重置";
     } else if (msg.type === "pose" && msg.p) {
       appendTrajPoint(msg.p);
-      if (replay) return;
       pose = msg.p;
       onDevicePose(msg.p, msg.q);
       elReady.className = "pill on";
@@ -1092,10 +1084,8 @@
       const fresh = persistPos.length === 0;
       setPersist(frame.pts, fresh);
       if (frame.traj && frame.traj.length) setTraj(frame.traj, true);
-      if (!replay) {
-        refreshFloors(true);
-        if (fresh) needFit = true;
-      }
+      refreshFloors(true);
+      if (fresh) needFit = true;
       ackCloud();
     } else if (frame.kind === 2) {
       setPersist(frame.pts, false);
@@ -1270,324 +1260,10 @@
     fetch("/api/reset", { method: "POST" }).catch(() => {});
   });
 
-  const REPLAY_WALK_MPS = 0.8;
-  const REPLAY_SEE_M = 12;
-
-  function fmtClock(s) {
-    s = Math.max(0, Math.round(s));
-    const m = Math.floor(s / 60);
-    return `${m}:${String(s % 60).padStart(2, "0")}`;
-  }
-
-  function upperBound(times, t) {
-    let lo = 0;
-    let hi = times.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (times[mid] <= t) lo = mid + 1;
-      else hi = mid;
-    }
-    return lo;
-  }
-
-  function strideXYZ(src, maxPoints) {
-    const n = src.length / 3;
-    if (n <= maxPoints) return src.slice();
-    const out = new Float32Array(maxPoints * 3);
-    for (let i = 0; i < maxPoints; i++) {
-      const j = Math.round(i * (n - 1) / (maxPoints - 1));
-      out[i * 3] = src[j * 3];
-      out[i * 3 + 1] = src[j * 3 + 1];
-      out[i * 3 + 2] = src[j * 3 + 2];
-    }
-    return out;
-  }
-
-  function timelineFor(pts, traj) {
-    const nTr = traj.length / 3;
-    const trT = new Float32Array(nTr);
-    let acc = 0;
-    for (let i = 1; i < nTr; i++) {
-      acc += Math.hypot(
-        traj[i * 3] - traj[(i - 1) * 3],
-        traj[i * 3 + 1] - traj[(i - 1) * 3 + 1],
-        traj[i * 3 + 2] - traj[(i - 1) * 3 + 2]
-      );
-      trT[i] = acc / REPLAY_WALK_MPS;
-    }
-    const nPts = pts.length / 3;
-    const ptT = new Float32Array(nPts);
-    if (!nTr || !nPts) return { pts, ptT, traj, trT, dur: nTr ? trT[nTr - 1] : 0 };
-    const cell = 4;
-    const buckets = new Map();
-    for (let i = 0; i < nTr; i++) {
-      const key = `${Math.floor(traj[i * 3] / cell)},${Math.floor(traj[i * 3 + 1] / cell)},${Math.floor(traj[i * 3 + 2] / cell)}`;
-      let list = buckets.get(key);
-      if (!list) {
-        list = [];
-        buckets.set(key, list);
-      }
-      list.push(i);
-    }
-    const see2 = REPLAY_SEE_M * REPLAY_SEE_M;
-    for (let p = 0; p < nPts; p++) {
-      const x = pts[p * 3];
-      const y = pts[p * 3 + 1];
-      const z = pts[p * 3 + 2];
-      const cx = Math.floor(x / cell);
-      const cy = Math.floor(y / cell);
-      const cz = Math.floor(z / cell);
-      let first = -1;
-      let near = 0;
-      let nearD = Infinity;
-      for (let r = 1; r <= 3 && first < 0; r++) {
-        for (let dx = -r; dx <= r; dx++) {
-          for (let dy = -r; dy <= r; dy++) {
-            for (let dz = -r; dz <= r; dz++) {
-              const list = buckets.get(`${cx + dx},${cy + dy},${cz + dz}`);
-              if (!list) continue;
-              for (let k = 0; k < list.length; k++) {
-                const i = list[k];
-                const ddx = traj[i * 3] - x;
-                const ddy = traj[i * 3 + 1] - y;
-                const ddz = traj[i * 3 + 2] - z;
-                const d2 = ddx * ddx + ddy * ddy + ddz * ddz;
-                if (d2 <= see2 && (first < 0 || i < first)) first = i;
-                if (d2 < nearD) {
-                  nearD = d2;
-                  near = i;
-                }
-              }
-            }
-          }
-        }
-      }
-      ptT[p] = trT[first >= 0 ? first : near];
-    }
-    const order = Array.from({ length: nPts }, (_, i) => i);
-    order.sort((a, b) => ptT[a] - ptT[b]);
-    const ptsS = new Float32Array(nPts * 3);
-    const tS = new Float32Array(nPts);
-    for (let k = 0; k < nPts; k++) {
-      const i = order[k];
-      ptsS[k * 3] = pts[i * 3];
-      ptsS[k * 3 + 1] = pts[i * 3 + 1];
-      ptsS[k * 3 + 2] = pts[i * 3 + 2];
-      tS[k] = ptT[i];
-    }
-    return { pts: ptsS, ptT: tS, traj, trT, dur: trT[nTr - 1] || 0 };
-  }
-
-  function packRecording(rec) {
-    const npts = rec.pts.length / 3;
-    const ntraj = rec.traj.length / 3;
-    const buf = new ArrayBuffer(32 + npts * 16 + ntraj * 16);
-    const view = new DataView(buf);
-    view.setUint8(0, 82);
-    view.setUint8(1, 80);
-    view.setUint8(2, 76);
-    view.setUint8(3, 89);
-    view.setUint32(4, 1, true);
-    view.setUint32(8, npts, true);
-    view.setUint32(12, ntraj, true);
-    view.setFloat64(16, 0, true);
-    view.setFloat64(24, rec.dur, true);
-    let off = 32;
-    new Float32Array(buf, off, npts * 3).set(rec.pts);
-    off += npts * 12;
-    new Float32Array(buf, off, npts).set(rec.ptT);
-    off += npts * 4;
-    new Float32Array(buf, off, ntraj * 3).set(rec.traj);
-    off += ntraj * 12;
-    new Float32Array(buf, off, ntraj).set(rec.trT);
-    return buf;
-  }
-
-  function fileStamp() {
-    const d = new Date();
-    const p = (n) => String(n).padStart(2, "0");
-    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-  }
-
-  async function writeLocalFile(bytes, name) {
-    if (window.showSaveFilePicker) {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: name,
-        types: [{ description: "点云轨迹", accept: { "application/octet-stream": [".bin"] } }],
-      });
-      const writable = await handle.createWritable();
-      await writable.write(bytes);
-      await writable.close();
-      return;
-    }
-    const a = document.createElement("a");
-    const url = URL.createObjectURL(new Blob([bytes]));
-    a.href = url;
-    a.download = name;
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-  }
-
-  async function saveRecording() {
-    const btn = document.getElementById("saveRec");
-    if (!persistPos.length && !trajPos.length) {
-      elReady.className = "pill wait";
-      elReady.textContent = "没有可保存的内容";
-      return;
-    }
-    btn.disabled = true;
-    btn.textContent = "保存中";
-    try {
-      const pts = strideXYZ(persistPos, 200000);
-      const traj = strideXYZ(trajPos, 20000);
-      const rec = timelineFor(pts, traj);
-      const name = `lidar-${fileStamp()}.bin`;
-      await writeLocalFile(packRecording(rec), name);
-      elReady.className = "pill on";
-      elReady.textContent = "已保存到本机";
-    } catch (err) {
-      if (err && err.name === "AbortError") return;
-      elReady.className = "pill off";
-      elReady.textContent = "保存失败";
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "保存";
-    }
-  }
-
-  function exitReplay() {
-    replay = null;
-    document.getElementById("replayBar").hidden = true;
-    const btn = document.getElementById("replayBtn");
-    btn.textContent = "回放";
-    btn.classList.remove("on");
-    viewDirty = true;
-  }
-
-  function startReplay(buf) {
-    const view = new DataView(buf);
-    const magic = String.fromCharCode(
-      view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
-    if (buf.byteLength < 32 || magic !== "RPLY") throw new Error("bad file");
-    const npts = view.getUint32(8, true);
-    const ntraj = view.getUint32(12, true);
-    const t0 = view.getFloat64(16, true);
-    const t1 = view.getFloat64(24, true);
-    let off = 32;
-    const pts = new Float32Array(buf.slice(off, off + npts * 12));
-    off += npts * 12;
-    const ptT = new Float32Array(buf.slice(off, off + npts * 4));
-    off += npts * 4;
-    const traj = new Float32Array(buf.slice(off, off + ntraj * 12));
-    off += ntraj * 12;
-    const trT = new Float32Array(buf.slice(off, off + ntraj * 4));
-    replay = {
-      pts, ptT, traj, trT,
-      dur: Math.max(0, t1 - t0),
-      cursor: 0,
-      playing: true,
-      speed: 4,
-      last: performance.now(),
-      shownPts: -1,
-      shownTr: -1,
-      cloud: new Float32Array(0),
-      trajShown: new Float32Array(0),
-    };
-    document.getElementById("replayBar").hidden = false;
-    document.getElementById("replayPlay").textContent = "暂停";
-    document.getElementById("replaySpeed").textContent = "4×";
-    document.getElementById("replayScrub").value = "0";
-    const btn = document.getElementById("replayBtn");
-    btn.textContent = "回放中";
-    btn.classList.add("on");
-    elReady.className = "pill on";
-    elReady.textContent = "回放";
-    needFit = true;
-    viewDirty = true;
-  }
-
-  function paintReplay() {
-    const now = performance.now();
-    if (replay.playing) {
-      const dt = replay.last ? (now - replay.last) / 1000 : 0;
-      replay.cursor = Math.min(replay.dur, replay.cursor + dt * replay.speed);
-      if (replay.cursor >= replay.dur - 1e-3) {
-        replay.cursor = replay.dur;
-        replay.playing = false;
-        document.getElementById("replayPlay").textContent = "播放";
-      }
-      const scrub = document.getElementById("replayScrub");
-      if (scrub && replay.dur > 0) scrub.value = String(Math.round(1000 * replay.cursor / replay.dur));
-    }
-    replay.last = now;
-    document.getElementById("replayClock").textContent =
-      `${fmtClock(replay.cursor)} / ${fmtClock(replay.dur)}`;
-    const nPts = upperBound(replay.ptT, replay.cursor);
-    if (nPts !== replay.shownPts) {
-      replay.shownPts = nPts;
-      replay.cloud = replay.pts.subarray(0, nPts * 3);
-      viewDirty = true;
-    }
-    const nTr = upperBound(replay.trT, replay.cursor);
-    if (nTr !== replay.shownTr) {
-      replay.shownTr = nTr;
-      replay.trajShown = replay.traj.subarray(0, nTr * 3);
-      elTraj.textContent = String(nTr);
-      viewDirty = true;
-    }
-    if (nTr > 0) {
-      const i = nTr - 1;
-      pose = [replay.traj[i * 3], replay.traj[i * 3 + 1], replay.traj[i * 3 + 2]];
-      onDevicePose(pose);
-    }
-  }
-
-  document.getElementById("saveRec").addEventListener("click", () => { saveRecording(); });
-  document.getElementById("replayBtn").addEventListener("click", () => {
-    if (replay) exitReplay();
-    else document.getElementById("replayFile").click();
-  });
-  document.getElementById("replayFile").addEventListener("change", (e) => {
-    const file = e.target.files && e.target.files[0];
-    e.target.value = "";
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        startReplay(reader.result);
-      } catch (err) {
-        elReady.className = "pill off";
-        elReady.textContent = "文件无法回放";
-      }
-    };
-    reader.readAsArrayBuffer(file);
-  });
-  document.getElementById("replayExit").addEventListener("click", exitReplay);
-  document.getElementById("replayPlay").addEventListener("click", () => {
-    if (!replay) return;
-    if (!replay.playing && replay.cursor >= replay.dur - 1e-3) replay.cursor = 0;
-    replay.playing = !replay.playing;
-    replay.last = performance.now();
-    document.getElementById("replayPlay").textContent = replay.playing ? "暂停" : "播放";
-  });
-  document.getElementById("replaySpeed").addEventListener("click", () => {
-    if (!replay) return;
-    replay.speed = replay.speed === 1 ? 4 : replay.speed === 4 ? 16 : 1;
-    document.getElementById("replaySpeed").textContent = `${replay.speed}×`;
-  });
-  const replayScrub = document.getElementById("replayScrub");
-  replayScrub.addEventListener("input", () => {
-    if (!replay) return;
-    replay.playing = false;
-    replay.cursor = replay.dur * Number(replayScrub.value) / 1000;
-    document.getElementById("replayPlay").textContent = "播放";
-  });
-
   updateLayerLabel();
 
   function tick() {
     resize();
-    if (replay) paintReplay();
     if (viewDirty) applyView();
     if (needFit && persistPos.length > 90) {
       applyView();

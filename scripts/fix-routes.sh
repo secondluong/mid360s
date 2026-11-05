@@ -1,7 +1,8 @@
 #!/bin/bash
 # Split T6 routing:
 #   Mid-360  → lidar ethernet /32
-#   MyView cloud → 4G WAN (default + optional host /32)
+#   MyView     → host /32: WiFi when it reaches MyView, else 4G with internet
+#                (MYVIEW_VIA=wifi-first, see myview_settings.py)
 #   Local LAN  → WiFi STA
 # Demote WiFi default so 4G owns 0.0.0.0/0.
 
@@ -22,8 +23,12 @@ LAN_IF="${LAN_INTERFACE:-auto}"
 WAN_IF="${WAN_INTERFACE:-auto}"
 LAN_SUBNET="${LAN_SUBNET:-}"
 LIDAR_SUBNET="${LIDAR_SUBNET:-192.168.1.0/24}"
+MYVIEW_VIA="${MYVIEW_VIA:-wifi-first}"
+# The settings page owns the MyView address once it has saved myview.json.
+if settings_env="$(python3 "${SCRIPT_DIR}/myview_settings.py" shell 2>/dev/null)"; then
+  eval "${settings_env}"
+fi
 MYVIEW_URL="${MYVIEW_SERVER_URL:-}"
-MYVIEW_VIA="${MYVIEW_VIA:-auto}"
 VERBOSE="${FIX_ROUTES_VERBOSE:-false}"
 
 if [ "${LAN_IF}" = "auto" ] || [ -z "${LAN_IF}" ]; then
@@ -102,6 +107,13 @@ if iface_exists "${LIDAR_IF}" && iface_has_pc_ip "${LIDAR_IF}"; then
   route_delete "${LIDAR_SUBNET}" "${LIDAR_IF}" 200
   route_delete "${LIDAR_IP}" "${LIDAR_IF}" 200
   route_replace "${LIDAR_IP}/32" "${LIDAR_IF}" 50
+  # A replaced lidar leaves its old /32 behind.
+  for old in $(_ip -4 route show dev "${LIDAR_IF}" 2>/dev/null \
+      | awk '/ metric 50( |$)/ && $1 ~ /^[0-9.]+$/ {print $1}'); do
+    if [ "${old}" != "${LIDAR_IP}" ]; then
+      _ip route del "${old}/32" dev "${LIDAR_IF}" metric 50 2>/dev/null || true
+    fi
+  done
   lidar_route_ok "${LIDAR_IP}" "${LIDAR_IF}" && lidar_route_ready=true
 fi
 
@@ -143,8 +155,22 @@ if [ -z "${LAN_SUBNET}" ] && [ -n "${LAN_IF}" ] && iface_has_ipv4 "${LAN_IF}"; t
   fi
 fi
 
-# MyView: cloud via 4G, private LAN IP via WiFi.
-if [ -n "${host:-}" ] && [ "${host}" != "${MYVIEW_URL}" ]; then
+case "${MYVIEW_VIA}" in
+  wan|WAN|lan|LAN|auto) legacy_myview=true ;;
+  *) legacy_myview=false ;;
+esac
+
+if [ "${legacy_myview}" = "false" ]; then
+  via_role="${MYVIEW_VIA}"
+  if [ "${FIX_ROUTES_MYVIEW_FORCE:-false}" = "true" ]; then
+    python3 "${SCRIPT_DIR}/myview_settings.py" route --force && myview_route_ready=true
+  else
+    python3 "${SCRIPT_DIR}/myview_settings.py" route && myview_route_ready=true
+  fi
+fi
+
+# Legacy MyView modes: cloud via 4G, private LAN IP via WiFi.
+if [ "${legacy_myview}" = "true" ] && [ -n "${host:-}" ] && [ "${host}" != "${MYVIEW_URL}" ]; then
   if [ "${via_role}" = "lan" ] && [ -n "${LAN_IF}" ]; then
     if iface_has_ipv4 "${LAN_IF}" || iface_is_up "${LAN_IF}"; then
       if is_private_ipv4 "${host}"; then

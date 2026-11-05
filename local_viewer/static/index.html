@@ -4,13 +4,15 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>板载点云 · Mid-360</title>
-  <link rel="stylesheet" href="/style.css?v=8" />
+  <link rel="stylesheet" href="/style.css?v=11" />
 </head>
 <body>
   <header class="bar">
     <div class="brand">板载点云</div>
     <div id="conn" class="pill off">未连接</div>
     <div id="ready" class="pill off">等待里程计</div>
+    <button type="button" id="mvBtn" title="激光雷达 IP、MyView 推送地址">设置</button>
+    <div id="mvPill" class="pill idle" title="">MyView 未启用</div>
 
     <div class="dd" id="layerDd">
       <button type="button" id="layerBtn" class="dd-btn">图层 4</button>
@@ -44,16 +46,6 @@
     <label class="chk"><input type="checkbox" id="follow" checked /> 跟随设备</label>
     <button type="button" id="fit">看全图</button>
     <button type="button" id="reset" title="清除点云与轨迹，并把当前位置和朝向设为地图原点">重置</button>
-    <button type="button" id="saveRec" title="把当前点云和轨迹保存到本机">保存</button>
-    <button type="button" id="replayBtn" title="选择已保存的文件进行回放">回放</button>
-    <input type="file" id="replayFile" accept=".bin,application/octet-stream" hidden />
-    <div id="replayBar" hidden>
-      <button type="button" id="replayPlay">播放</button>
-      <input type="range" id="replayScrub" min="0" max="1000" value="0" />
-      <span id="replayClock">0:00 / 0:00</span>
-      <button type="button" id="replaySpeed" title="播放速度">4×</button>
-      <button type="button" id="replayExit">返回实时</button>
-    </div>
   </header>
 
   <div id="info">
@@ -65,11 +57,80 @@
     <span id="session" class="session">—</span>
   </div>
   <div id="hint">局域网只读 · 已收到的点留在本页</div>
+
+  <div id="mvModal" class="modal" hidden>
+    <form class="modal-card" id="mvForm" autocomplete="off" novalidate>
+      <h3>设置</h3>
+
+      <div class="mv-section">激光雷达</div>
+      <div class="mv-grid">
+        <label class="mv-field">雷达 IP
+          <input id="lidarIp" placeholder="例如 192.168.1.114" spellcheck="false" />
+          <span class="mv-err" data-for="lidarIp"></span>
+        </label>
+        <label class="mv-field mv-port">序列号后两位
+          <input id="lidarSn" inputmode="numeric" maxlength="2" placeholder="如 14" />
+        </label>
+      </div>
+      <small class="mv-note">Mid-360 出厂 IP 是 192.168.1.1 加机身序列号后两位，例如序列号以 14 结尾就是 192.168.1.114。填序列号后两位会自动算出 IP。更换雷达 IP 后采集程序会重启，约 1 分钟，页面上已有的点云会清空。<span id="lidarState"></span></small>
+
+      <div class="mv-section">MyView 推送</div>
+      <p class="modal-sub">把轨迹和点云推送到 MyView，由 MyView 在自己的平台上重建点云、画轨迹。有 WiFi 时优先走 WiFi，没有 WiFi 时走 4G。</p>
+
+      <label class="chk mv-row"><input type="checkbox" id="mvEnabled" /> 启用推送</label>
+      <div class="mv-grid">
+        <label class="mv-field">MyView IP
+          <input id="mvHost" placeholder="例如 192.168.1.100" spellcheck="false" />
+          <span class="mv-err" data-for="host"></span>
+        </label>
+        <label class="mv-field mv-port">端口
+          <input id="mvPort" type="number" min="1" max="65535" placeholder="3000" />
+          <span class="mv-err" data-for="port"></span>
+        </label>
+      </div>
+
+      <details id="mvAdv">
+        <summary>高级</summary>
+        <label class="mv-field">Bridge Token
+          <input id="mvToken" type="password" placeholder="留空表示保留当前值" autocomplete="new-password" />
+          <small>MyView 里为雷达生成的 Bridge Token，不是浏览器登录用的 eyJ 开头的 token。<span id="mvTokenState"></span></small>
+        </label>
+        <label class="chk mv-row"><input type="checkbox" id="mvClearToken" /> 清除已保存的 Token</label>
+        <label class="chk mv-row"><input type="checkbox" id="mvSecure" /> 使用加密连接（wss）</label>
+        <label class="mv-field">设备 ID
+          <input id="mvDevice" spellcheck="false" />
+          <span class="mv-err" data-for="deviceId"></span>
+        </label>
+        <div class="mv-grid">
+          <label class="mv-field">点云频率（Hz）
+            <input id="mvHz" type="number" min="0.2" max="20" step="0.5" />
+            <span class="mv-err" data-for="cloudHz"></span>
+          </label>
+          <label class="mv-field">每帧最大点数
+            <input id="mvPts" type="number" min="500" max="100000" step="500" />
+            <span class="mv-err" data-for="cloudMaxPoints"></span>
+          </label>
+        </div>
+      </details>
+
+      <div class="mv-status" id="mvStatus">—</div>
+      <div class="mv-msg" id="mvMsg"></div>
+
+      <div class="mv-actions">
+        <button type="button" id="mvTest">测试连接</button>
+        <span class="mv-sp"></span>
+        <button type="button" id="mvCancel">取消</button>
+        <button type="submit" id="mvSave" class="on">保存</button>
+      </div>
+    </form>
+  </div>
+
   <canvas id="c"></canvas>
   <script type="importmap">
     { "imports": { "three": "/three-shim.js" } }
   </script>
   <script src="/three.min.js"></script>
-  <script src="/viewer.js?v=68"></script>
+  <script src="/viewer.js?v=71"></script>
+  <script src="/myview.js?v=2"></script>
 </body>
 </html>
