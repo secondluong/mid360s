@@ -15,6 +15,7 @@ other one can still be probed while it is not carrying the push.
 CLI:
   myview_settings.py shell            shell assignments for entrypoint/fix-routes
   myview_settings.py lidar-ip         lidar IP in effect (settings page, else .env)
+  myview_settings.py gateway DEV      router on DEV, even without nmcli
   myview_settings.py signature        changes whenever the relay must restart
   myview_settings.py route [--force]  pick and pin the MyView egress
   myview_settings.py test             probe both uplinks, print JSON
@@ -336,7 +337,49 @@ def gateway(dev: str, table: str, cache: dict) -> Optional[str]:
         m = re.search(r"routers\s*=\s*(\d+\.\d+\.\d+\.\d+)", out)
         if m:
             return m.group(1)
-    return cache.get(dev)
+    return cache.get(dev) or guess_gateway(dev)
+
+
+def _nameservers() -> list:
+    found = []
+    for name in ("/run/NetworkManager/resolv.conf", "/etc/resolv.conf"):
+        try:
+            with open(name, encoding="utf-8") as f:
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0] == "nameserver" and parts[1] not in found:
+                        found.append(parts[1])
+        except OSError:
+            continue
+    return found
+
+
+def guess_gateway(dev: str) -> Optional[str]:
+    """Router on dev when neither the kernel nor nmcli knows it.
+
+    The container has no nmcli. An on-link nameserver is usually the home
+    router, else the subnet's .1. Taken only if it answers on dev.
+    """
+    _, out = _ip("-4", "-o", "addr", "show", "dev", dev, "scope", "global")
+    m = re.search(r"inet (\d+\.\d+\.\d+\.\d+/\d+)", out)
+    if not m:
+        return None
+    iface = ipaddress.ip_interface(m.group(1))
+    candidates = []
+    for ns in _nameservers():
+        try:
+            if ipaddress.IPv4Address(ns) in iface.network and ns != str(iface.ip):
+                candidates.append(ns)
+        except ValueError:
+            continue
+    first = str(next(iface.network.hosts(), ""))
+    if first and first != str(iface.ip) and first not in candidates:
+        candidates.append(first)
+    for ip in candidates:
+        rc, _ = _run(["ping", "-c", "1", "-W", "1", "-I", dev, ip], timeout=3)
+        if rc == 0:
+            return ip
+    return None
 
 
 def _rule_lines(prio: str):
@@ -615,6 +658,11 @@ def main(argv) -> int:
     if cmd == "lidar-ip":
         print(load_lidar()["lidarIp"])
         return 0
+    if cmd == "gateway" and len(argv) > 2:
+        gw = gateway(argv[2], "main", {})
+        if gw:
+            print(gw)
+        return 0 if gw else 1
     if cmd == "signature":
         print(signature(load()))
         return 0

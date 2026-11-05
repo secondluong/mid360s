@@ -130,10 +130,7 @@ if [ -n "${LAN_IF}" ] && iface_exists "${LAN_IF}"; then
   else
     wifi_gw="$(_ip -4 route show default dev "${LAN_IF}" 2>/dev/null | awk '/default/ {print $3; exit}')"
     if [ -z "${wifi_gw}" ]; then
-      wifi_gw="$(nmcli -g IP4.GATEWAY device show "${LAN_IF}" 2>/dev/null || true)"
-    fi
-    if [ -z "${wifi_gw}" ] || [ "${wifi_gw}" = "--" ]; then
-      wifi_gw="$(nmcli -g IP4.DNS device show "${LAN_IF}" 2>/dev/null | awk 'NR==1{print; exit}')"
+      wifi_gw="$(python3 "${SCRIPT_DIR}/myview_settings.py" gateway "${LAN_IF}" 2>/dev/null || true)"
     fi
     if [ -n "${wifi_gw}" ] && [ "${wifi_gw}" != "--" ]; then
       _ip route replace default via "${wifi_gw}" dev "${LAN_IF}" metric 700 2>/dev/null || true
