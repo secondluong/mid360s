@@ -6,6 +6,7 @@
   const elStatus = $("mvStatus");
   const elMsg = $("mvMsg");
   const VIA = { wifi: "WiFi", "4g": "4G" };
+  const MODE = { auto: "自动切换（优先 WiFi）", wifi: "只走 WiFi", "4g": "只走 4G" };
   let last = null;
   let busy = false;
 
@@ -57,6 +58,7 @@
       lines.push("推送未启用。");
     } else {
       lines.push(`目标：${s.url}${r.ip && r.ip !== s.host ? `（${r.ip}）` : ""}`);
+      lines.push(`推送路由：${MODE[s.via || "auto"]}`);
       lines.push(`当前出口：${viaText(r)}${r.reason ? ` · ${r.reason}` : ""}`);
       if (relay.connected) {
         lines.push(
@@ -119,9 +121,9 @@
     $("mvEnabled").checked = !!s.enabled;
     $("mvHost").value = s.host || "";
     $("mvPort").value = s.port || 3000;
-    $("mvToken").value = "";
-    $("mvClearToken").checked = false;
-    $("mvTokenState").textContent = s.hasToken ? " 当前已保存 Token。" : " 当前未设置 Token。";
+    $("mvVia").value = s.via || "auto";
+    $("mvToken").value = s.token || "";
+    $("mvTokenState").textContent = s.hasToken ? "" : " 当前未设置 Token。";
     $("mvSecure").checked = !!s.secure;
     $("mvDevice").value = s.deviceId || "";
     $("mvHz").value = s.cloudHz != null ? s.cloudHz : 5;
@@ -133,8 +135,9 @@
       enabled: $("mvEnabled").checked,
       host: $("mvHost").value.trim(),
       port: $("mvPort").value.trim(),
-      token: $("mvToken").value,
-      clearToken: $("mvClearToken").checked,
+      via: $("mvVia").value,
+      token: $("mvToken").value.trim(),
+      clearToken: !$("mvToken").value.trim(),
       secure: $("mvSecure").checked,
       deviceId: $("mvDevice").value.trim(),
       cloudHz: $("mvHz").value,
@@ -218,9 +221,17 @@
         setMsg(data.error, "bad");
         return;
       }
-      const choice =
-        data.choice === "wifi" ? "将走 WiFi 推送。" : data.choice === "4g" ? "将走 4G 推送。" : "WiFi 和 4G 都连不上这个地址。";
-      const good = data.choice !== "none" && ((data.wifi && data.wifi.ok) || (data.wan && data.wan.ok));
+      const picked = data.choice === "wifi" ? data.wifi : data.choice === "4g" ? data.wan : null;
+      let choice;
+      if (body.via === "wifi") {
+        choice = !data.wifi ? "只走 WiFi，但 WiFi 未连接。" : data.wifi.ok ? "将走 WiFi 推送。" : "只走 WiFi，但经 WiFi 连不上这个地址。";
+      } else if (body.via === "4g") {
+        choice = !data.wan ? "只走 4G，但没有接入 4G。" : data.wan.ok ? "将走 4G 推送。" : "只走 4G，但经 4G 连不上这个地址。";
+      } else {
+        choice =
+          data.choice === "wifi" ? "将走 WiFi 推送。" : data.choice === "4g" ? "将走 4G 推送。" : "WiFi 和 4G 都连不上这个地址。";
+      }
+      const good = !!(picked && picked.ok);
       setMsg([testLine("WiFi", data.wifi), testLine("4G", data.wan), choice].join("\n"), good ? "good" : "bad");
     } catch (e) {
       setMsg(`测试失败：${e}`, "bad");

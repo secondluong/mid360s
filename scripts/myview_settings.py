@@ -7,8 +7,9 @@ myview.json next to route.json, both under the settings dir that
 docker-compose mounts from ./data/settings.
 
 Egress policy for the MyView host only (the board's default route is left to
-fix-routes.sh): WiFi when it can reach MyView, otherwise 4G when 4G reaches
-the public internet. The choice is a /32 in the main table, so the relay
+fix-routes.sh), chosen on the settings page: "auto" uses WiFi when it can
+reach MyView, otherwise 4G when 4G reaches the public internet; "wifi" and
+"4g" always use that uplink. The choice is a /32 in the main table, so the relay
 needs no socket options. Each uplink also gets a source-address table so the
 other one can still be probed while it is not carrying the push.
 
@@ -59,6 +60,8 @@ HOST_RE = re.compile(
 )
 DEVICE_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 PLACEHOLDER_HOSTS = ("your-myview-host", "host.docker.internal")
+# auto: WiFi first, 4G fallback. wifi / 4g: pin the push to that uplink.
+VIA_MODES = ("auto", "wifi", "4g")
 
 
 # ── settings file ────────────────────────────────────────────────────
@@ -131,6 +134,7 @@ def env_defaults() -> dict:
         "deviceId": _env("MYVIEW_DEVICE_ID", "lidar-t6-mid360s-01"),
         "cloudHz": float(_env("RELAY_CLOUD_HZ", "5")),
         "cloudMaxPoints": int(_env("RELAY_CLOUD_MAX_POINTS", "8000")),
+        "via": "auto",
     }
 
 
@@ -206,6 +210,13 @@ def merge(update: dict, base: dict) -> Tuple[dict, Dict[str, str]]:
         except (TypeError, ValueError):
             errors["cloudMaxPoints"] = "每帧最大点数要在 500-100000 之间"
 
+    if "via" in update:
+        v = str(update.get("via") or "").strip().lower()
+        if v not in VIA_MODES:
+            errors["via"] = "推送路由只能是 自动、WiFi 或 4G"
+        else:
+            out["via"] = v
+
     if out.get("enabled") and not out.get("host"):
         errors.setdefault("host", "启用推送前要先填 MyView IP")
     return out, errors
@@ -257,7 +268,7 @@ def server_url(s: dict) -> str:
 
 
 def public_view(s: dict) -> dict:
-    v = {k: s[k] for k in s if k != "token"}
+    v = dict(s)
     v["hasToken"] = bool(s.get("token"))
     v["url"] = server_url(s)
     return v
@@ -524,8 +535,10 @@ def select_route(force: bool = False) -> dict:
         _finish(result, state)
         return result
 
+    mode = s.get("via", "auto")
+    result["mode"] = mode
     prev = state.get("decision") or {}
-    key = f"{ip}:{s['port']}"
+    key = f"{ip}:{s['port']}:{mode}"
     same_links = prev.get("links") == {r: (l["iface"], l["addr"]) for r, l in links.items()}
     if not force and prev.get("key") == key and same_links and now - prev.get("checkedAt", 0) < CHECK_S:
         via = prev.get("via", "none")
@@ -554,7 +567,19 @@ def select_route(force: bool = False) -> dict:
             streak["ok"], streak["fail"] = 0, streak.get("fail", 0) + 1
         cur = prev.get("via") if prev.get("key") == key else None
 
-        if wifi_ok and (cur != "4g" or streak["ok"] >= SWITCH_STREAK or not wan_net):
+        if mode == "wifi":
+            if wifi:
+                via = "wifi"
+                reason = "固定走 WiFi" if wifi_ok else f"固定走 WiFi，但连不上 MyView（{wifi_err}）"
+            else:
+                via, reason = "none", "固定走 WiFi，但 WiFi 未连接"
+        elif mode == "4g":
+            if wan:
+                via = "4g"
+                reason = "固定走 4G" if wan_net else "固定走 4G，但 4G 上不了公网"
+            else:
+                via, reason = "none", "固定走 4G，但没有接入 4G"
+        elif wifi_ok and (cur != "4g" or streak["ok"] >= SWITCH_STREAK or not wan_net):
             via, reason = "wifi", "WiFi 可达 MyView"
         elif wifi_ok:
             via, reason = "4g", "WiFi 已恢复，再确认一次后切回 WiFi"
@@ -624,7 +649,13 @@ def test_connection(s: dict) -> dict:
         ok, err, ms = probe(w["addr"], ip, s["port"])
         out["wan"] = {"iface": w["iface"], "addr": w["addr"], "ok": ok, "error": err, "ms": ms,
                       "internet": has_internet(w["addr"])}
-    if out["wifi"] and out["wifi"]["ok"]:
+    mode = s.get("via", "auto")
+    out["mode"] = mode
+    if mode == "wifi":
+        out["choice"] = "wifi" if out["wifi"] else "none"
+    elif mode == "4g":
+        out["choice"] = "4g" if out["wan"] else "none"
+    elif out["wifi"] and out["wifi"]["ok"]:
         out["choice"] = "wifi"
     elif out["wan"] and out["wan"]["internet"]:
         out["choice"] = "4g"

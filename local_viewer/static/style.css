@@ -58,7 +58,7 @@ html, body {
 .modal-sub { margin: 0; font-size: 12px; opacity: 0.7; }
 .mv-grid { display: grid; grid-template-columns: 1fr 110px; gap: 10px; }
 .mv-field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; opacity: 0.95; }
-.mv-field input {
+.mv-field input, .mv-field select {
   width: 100%;
   background: #1c2733;
   color: #e8eef6;
@@ -67,7 +67,7 @@ html, body {
   padding: 6px 8px;
   font: inherit;
 }
-.mv-field input:focus { outline: none; border-color: #4c8ec9; }
+.mv-field input:focus, .mv-field select:focus { outline: none; border-color: #4c8ec9; }
 .mv-field small { opacity: 0.6; line-height: 1.35; }
 .mv-row { font-size: 13px; }
 .mv-section {

@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>板载点云 · Mid-360</title>
-  <link rel="stylesheet" href="/style.css?v=11" />
+  <link rel="stylesheet" href="/style.css?v=12" />
 </head>
 <body>
   <header class="bar">
@@ -75,7 +75,7 @@
       <small class="mv-note">Mid-360 出厂 IP 是 192.168.1.1 加机身序列号后两位，例如序列号以 14 结尾就是 192.168.1.114。填序列号后两位会自动算出 IP。更换雷达 IP 后采集程序会重启，约 1 分钟，页面上已有的点云会清空。<span id="lidarState"></span></small>
 
       <div class="mv-section">MyView 推送</div>
-      <p class="modal-sub">把轨迹和点云推送到 MyView，由 MyView 在自己的平台上重建点云、画轨迹。有 WiFi 时优先走 WiFi，没有 WiFi 时走 4G。</p>
+      <p class="modal-sub">把轨迹和点云推送到 MyView，由 MyView 在自己的平台上重建点云、画轨迹。</p>
 
       <label class="chk mv-row"><input type="checkbox" id="mvEnabled" /> 启用推送</label>
       <div class="mv-grid">
@@ -88,14 +88,21 @@
           <span class="mv-err" data-for="port"></span>
         </label>
       </div>
+      <label class="mv-field">推送路由
+        <select id="mvVia">
+          <option value="auto">自动切换（优先 WiFi，WiFi 不通时走 4G）</option>
+          <option value="wifi">只走 WiFi</option>
+          <option value="4g">只走 4G</option>
+        </select>
+        <span class="mv-err" data-for="via"></span>
+      </label>
 
       <details id="mvAdv">
         <summary>高级</summary>
         <label class="mv-field">Bridge Token
-          <input id="mvToken" type="password" placeholder="留空表示保留当前值" autocomplete="new-password" />
-          <small>MyView 里为雷达生成的 Bridge Token，不是浏览器登录用的 eyJ 开头的 token。<span id="mvTokenState"></span></small>
+          <input id="mvToken" placeholder="未填写" spellcheck="false" autocomplete="off" />
+          <small>MyView 里为雷达生成的 Bridge Token，不是浏览器登录用的 eyJ 开头的 token。清空后保存即删除。<span id="mvTokenState"></span></small>
         </label>
-        <label class="chk mv-row"><input type="checkbox" id="mvClearToken" /> 清除已保存的 Token</label>
         <label class="chk mv-row"><input type="checkbox" id="mvSecure" /> 使用加密连接（wss）</label>
         <label class="mv-field">设备 ID
           <input id="mvDevice" spellcheck="false" />
@@ -131,6 +138,6 @@
   </script>
   <script src="/three.min.js"></script>
   <script src="/viewer.js?v=71"></script>
-  <script src="/myview.js?v=2"></script>
+  <script src="/myview.js?v=4"></script>
 </body>
 </html>
